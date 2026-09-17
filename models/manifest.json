@@ -1,0 +1,30 @@
+{
+  "model": "Qwen2.5-3B-Instruct",
+  "format": "CHPE-RAW-CONTIGUOUS",
+  "tile_bytes": 16384,
+  "cache_line_bytes": 64,
+  "files": {
+    "Qwen2.5-3B-Instruct.bf16.raw.chpe": {
+      "size_bytes": 6174363648,
+      "sha256": "2e488c001c02a9246f785cd21077cef2db03c956c9162f3af661897eb674b495",
+      "precision": "bf16",
+      "layers": 36,
+      "hidden_dim": 2048,
+      "intermediate_dim": 11008,
+      "num_heads": 16,
+      "num_kv_heads": 2,
+      "vocab_size": 151936
+    },
+    "Qwen2.5-3B-Instruct.fp16.raw.chpe": {
+      "size_bytes": 6174363648,
+      "sha256": "6384cbc01dfb48628e1997deff1ce1493a7f0b0dccb015f37c18665b92c65248",
+      "precision": "fp16",
+      "layers": 36,
+      "hidden_dim": 2048,
+      "intermediate_dim": 11008,
+      "num_heads": 16,
+      "num_kv_heads": 2,
+      "vocab_size": 151936
+    }
+  }
+}
