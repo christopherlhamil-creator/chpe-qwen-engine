@@ -228,7 +228,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Write spoke outbox telemetry via POSIX open
-    const out_path: [*:0]const u8 = "/home/christopherhamil/tot_hybrid/run/spoke_outbox/metal.qwen3b_fwd.result.json";
+    const out_path: [*:0]const u8 = "run/spoke_outbox/metal.qwen3b_fwd.result.json";
     const fd_val = std.os.linux.open(out_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
     if (std.os.linux.errno(fd_val) == .SUCCESS) {
         const fd: std.posix.fd_t = @intCast(fd_val);

@@ -44,7 +44,7 @@ zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl -Dcpu=neoverse_n1
 ```
 
 ### 2. Download Model Weights
-Model weights are hosted on private Hugging Face repository `Siddachan/qwen2.5-3b-chpe-raw`:
+Model weights are hosted on Hugging Face repository `Siddachan/qwen2.5-3b-chpe-raw`:
 ```bash
 # Authenticate with Hugging Face (reads ~/.cache/huggingface/token or HF_TOKEN)
 python3 scripts/fetch_weights.py --variant all

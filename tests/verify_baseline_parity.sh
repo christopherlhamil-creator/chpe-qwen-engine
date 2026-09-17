@@ -31,14 +31,14 @@ PRECISION=""
 if [ -f "models/Qwen2.5-3B-Instruct.fp16.raw.chpe" ]; then
     WEIGHTS="models/Qwen2.5-3B-Instruct.fp16.raw.chpe"
     PRECISION="fp16"
-elif [ -f "/home/christopherhamil/models/warc/Qwen2.5-3B-Instruct.fp16.raw.chpe" ]; then
-    WEIGHTS="/home/christopherhamil/models/warc/Qwen2.5-3B-Instruct.fp16.raw.chpe"
+elif [ -f "$HOME/models/warc/Qwen2.5-3B-Instruct.fp16.raw.chpe" ]; then
+    WEIGHTS="$HOME/models/warc/Qwen2.5-3B-Instruct.fp16.raw.chpe"
     PRECISION="fp16"
 elif [ -f "models/Qwen2.5-3B-Instruct.bf16.raw.chpe" ]; then
     WEIGHTS="models/Qwen2.5-3B-Instruct.bf16.raw.chpe"
     PRECISION="bf16"
-elif [ -f "/home/christopherhamil/models/warc/Qwen2.5-3B-Instruct.bf16.raw.chpe" ]; then
-    WEIGHTS="/home/christopherhamil/models/warc/Qwen2.5-3B-Instruct.bf16.raw.chpe"
+elif [ -f "$HOME/models/warc/Qwen2.5-3B-Instruct.bf16.raw.chpe" ]; then
+    WEIGHTS="$HOME/models/warc/Qwen2.5-3B-Instruct.bf16.raw.chpe"
     PRECISION="bf16"
 else
     echo "[FETCH] Weights not found locally. Attempting fetch..."

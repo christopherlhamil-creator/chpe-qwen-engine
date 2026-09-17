@@ -73,7 +73,7 @@ def main():
         sys.exit(1)
 
     # Check local models dir or system cache
-    system_warc = Path("/home/christopherhamil/models/warc")
+    system_warc = Path.home() / "models" / "warc"
 
     for filename in targets:
         dest = MODELS_DIR / filename
