@@ -1,0 +1,19 @@
+# Build artifacts
+zig-out/
+.zig-cache/
+*.o
+*.a
+bin/
+
+# Model weights (hosted on Hugging Face: Siddachan/qwen2.5-3b-chpe-raw)
+models/*.chpe
+models/*.gguf
+models/*.bin
+*.raw.chpe
+
+# Runtime logs and temporary files
+run/
+*.log
+*.tmp
+__pycache__/
+*.pyc
