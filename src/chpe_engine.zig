@@ -255,15 +255,17 @@ pub fn gemvTileW2(
         }
     }
 
-    const n_groups = cols / 128;
+    const max_rows = if (row_base >= y.len) 0 else @min(rows, y.len - row_base);
+    const n_groups = @min(cols / 128, x.len / 128);
+    const total_groups = cols / 128;
 
-    for (0..rows) |r| {
+    for (0..max_rows) |r| {
         var row_sum: f32 = 0.0;
         const row_bytes_offset = r * (cols / 4);
 
         if (group_scales) |gs| {
             for (0..n_groups) |g| {
-                const scale: f32 = @floatCast(gs[r * n_groups + g]);
+                const scale: f32 = @floatCast(gs[r * total_groups + g]);
                 const g_bytes = coded[row_bytes_offset + g * 32 .. row_bytes_offset + (g + 1) * 32];
                 const x_slice = x[g * 128 .. (g + 1) * 128];
 
@@ -291,8 +293,9 @@ pub fn gemvTileW2(
         } else {
             const scale = dims.scale;
             const bias = dims.bias;
+            const max_quads = @min(cols / 4, x.len / 4);
             const row_bytes = coded[row_bytes_offset .. row_bytes_offset + cols / 4];
-            for (0..cols / 4) |b| {
+            for (0..max_quads) |b| {
                 const byte_val = row_bytes[b];
                 const w0 = CODEBOOK_W2[byte_val & 0x03] * scale + bias;
                 const w1 = CODEBOOK_W2[(byte_val >> 2) & 0x03] * scale + bias;
@@ -319,7 +322,7 @@ pub fn gemvTileW2(
     }
 }
 
-/// 4-Bit Affine Symmetric GEMV with group-128 scaling
+/// 4-Bit Affine Symmetric GEMV with group-128 scaling & optional outlier protection
 pub fn gemvTileW4(
     cell: *const geometry.Cell,
     x: []const f32,
@@ -328,25 +331,82 @@ pub fn gemvTileW4(
     comptime accumulate: bool,
 ) void {
     const payload = &cell.semantic_payload;
+    const meta: *const TileMetadata = @ptrCast(@alignCast(payload.ptr));
     const dims: *const TileDims = @ptrCast(@alignCast(payload[32..48].ptr));
     const coded: [*]const u8 = @ptrCast(&cell.fingerprints);
 
     const rows: usize = dims.rows;
     const cols: usize = dims.cols;
-    const scale = dims.scale;
-    const bias = dims.bias;
+    const has_group128 = (meta.custom_flags & FLAG_GROUP128_OUTLIERS) != 0;
 
-    for (0..rows) |r| {
+    const group_scales: ?[*]const f16 = if (has_group128)
+        @ptrCast(@alignCast(payload[48..560].ptr))
+    else
+        null;
+
+    const has_outliers = has_group128 and rows == 16;
+    var x_outlier: @Vector(8, f32) = @splat(0.0);
+    var outlier_w_raw: [*]const f16 = undefined;
+    if (has_outliers) {
+        outlier_w_raw = @ptrCast(@alignCast(payload[560..816].ptr));
+        const outlier_cols_raw: [*]const u16 = @ptrCast(@alignCast(payload[816..832].ptr));
+        inline for (0..8) |k| {
+            const col_idx = outlier_cols_raw[k];
+            if (col_idx < x.len) {
+                x_outlier[k] = x[col_idx];
+            }
+        }
+    }
+
+    const max_rows = if (row_base >= y.len) 0 else @min(rows, y.len - row_base);
+
+    for (0..max_rows) |r| {
         var row_sum: f32 = 0.0;
-        const row_bytes = coded[r * (cols / 2) .. (r + 1) * (cols / 2)];
-        for (0..cols / 2) |b| {
-            const byte_val = row_bytes[b];
-            const nibble0 = @as(i8, @intCast(byte_val & 0x0F)) - 8;
-            const nibble1 = @as(i8, @intCast((byte_val >> 4) & 0x0F)) - 8;
-            const w0 = @as(f32, @floatFromInt(nibble0)) * scale + bias;
-            const w1 = @as(f32, @floatFromInt(nibble1)) * scale + bias;
-            const base = b * 2;
-            row_sum += w0 * x[base] + w1 * x[base + 1];
+        const row_bytes_offset = r * (cols / 2);
+
+        if (group_scales) |gs| {
+            const n_groups = @min(cols / 128, x.len / 128);
+            const total_groups = cols / 128;
+            for (0..n_groups) |g| {
+                const scale: f32 = @floatCast(gs[r * total_groups + g]);
+                const g_bytes = coded[row_bytes_offset + g * 64 .. row_bytes_offset + (g + 1) * 64];
+                const x_slice = x[g * 128 .. (g + 1) * 128];
+
+                var group_acc: f32 = 0.0;
+                var j: usize = 0;
+                while (j < 64) : (j += 4) {
+                    inline for (0..4) |idx| {
+                        const byte_val = g_bytes[j + idx];
+                        const q0 = @as(f32, @floatFromInt(byte_val & 0x0F)) - 8.0;
+                        const q1 = @as(f32, @floatFromInt((byte_val >> 4) & 0x0F)) - 8.0;
+                        const base = (j + idx) * 2;
+                        group_acc += q0 * x_slice[base] + q1 * x_slice[base + 1];
+                    }
+                }
+                row_sum += group_acc * scale;
+            }
+        } else {
+            const scale = dims.scale;
+            const bias = dims.bias;
+            const max_pairs = @min(cols / 2, x.len / 2);
+            const row_bytes = coded[row_bytes_offset .. row_bytes_offset + cols / 2];
+            for (0..max_pairs) |b| {
+                const byte_val = row_bytes[b];
+                const nibble0 = @as(i8, @intCast(byte_val & 0x0F)) - 8;
+                const nibble1 = @as(i8, @intCast((byte_val >> 4) & 0x0F)) - 8;
+                const w0 = @as(f32, @floatFromInt(nibble0)) * scale + bias;
+                const w1 = @as(f32, @floatFromInt(nibble1)) * scale + bias;
+                const base = b * 2;
+                row_sum += w0 * x[base] + w1 * x[base + 1];
+            }
+        }
+
+        if (has_outliers) {
+            var w_outlier: @Vector(8, f32) = undefined;
+            inline for (0..8) |k| {
+                w_outlier[k] = @floatCast(outlier_w_raw[r * 8 + k]);
+            }
+            row_sum += @reduce(.Add, w_outlier * x_outlier);
         }
 
         if (comptime accumulate) {
@@ -375,12 +435,14 @@ pub fn gemvTileW8(
     const bias = dims.bias;
 
     const Vec8 = @Vector(8, f32);
+    const max_rows = if (row_base >= y.len) 0 else @min(rows, y.len - row_base);
+    const max_cols = @min(cols, x.len);
 
-    for (0..rows) |r| {
+    for (0..max_rows) |r| {
         const row_weights = coded[r * cols .. (r + 1) * cols];
         var acc_vec: Vec8 = @splat(0.0);
         var i: usize = 0;
-        while (i + 8 <= cols) : (i += 8) {
+        while (i + 8 <= max_cols) : (i += 8) {
             const w_sub = row_weights[i..][0..8];
             const w_vec: Vec8 = .{
                 @floatFromInt(w_sub[0]),
@@ -396,7 +458,7 @@ pub fn gemvTileW8(
             acc_vec += w_vec * x_vec;
         }
         var row_sum: f32 = @reduce(.Add, acc_vec);
-        while (i < cols) : (i += 1) {
+        while (i < max_cols) : (i += 1) {
             row_sum += @as(f32, @floatFromInt(row_weights[i])) * x[i];
         }
 
@@ -426,21 +488,23 @@ pub fn gemvTileF16(
     const is_ieee_fp16 = (meta.custom_flags & FLAG_RAW_FP16) != 0;
 
     const Vec8 = @Vector(8, f32);
+    const max_rows = if (row_base >= y.len) 0 else @min(rows, y.len - row_base);
+    const max_cols = @min(cols, x.len);
 
     if (is_ieee_fp16) {
         const coded: [*]const f16 = @ptrCast(@alignCast(&cell.fingerprints));
-        for (0..rows) |r| {
+        for (0..max_rows) |r| {
             const row_weights = coded[r * cols .. (r + 1) * cols];
             var acc: Vec8 = @splat(0.0);
             var c: usize = 0;
-            while (c + 8 <= cols) : (c += 8) {
+            while (c + 8 <= max_cols) : (c += 8) {
                 const raw_f16: @Vector(8, f16) = row_weights[c..][0..8].*;
                 const w_v: Vec8 = @floatCast(raw_f16);
                 const x_v: Vec8 = x[c..][0..8].*;
                 acc = @mulAdd(Vec8, w_v, x_v, acc);
             }
             var sum: f32 = @reduce(.Add, acc);
-            while (c < cols) : (c += 1) {
+            while (c < max_cols) : (c += 1) {
                 sum += @as(f32, @floatCast(row_weights[c])) * x[c];
             }
             if (comptime accumulate) {
@@ -452,18 +516,18 @@ pub fn gemvTileF16(
     } else {
         // Native BF16: shift upper 16 bits to float32
         const coded_u16: [*]const u16 = @ptrCast(@alignCast(&cell.fingerprints));
-        for (0..rows) |r| {
+        for (0..max_rows) |r| {
             const row_weights = coded_u16[r * cols .. (r + 1) * cols];
             var acc: Vec8 = @splat(0.0);
             var c: usize = 0;
-            while (c + 8 <= cols) : (c += 8) {
+            while (c + 8 <= max_cols) : (c += 8) {
                 const w_u16: @Vector(8, u16) = row_weights[c..][0..8].*;
                 const w_v: Vec8 = @bitCast(@as(@Vector(8, u32), w_u16) << @splat(16));
                 const x_v: Vec8 = x[c..][0..8].*;
                 acc = @mulAdd(Vec8, w_v, x_v, acc);
             }
             var sum: f32 = @reduce(.Add, acc);
-            while (c < cols) : (c += 1) {
+            while (c < max_cols) : (c += 1) {
                 const w_f: f32 = @bitCast(@as(u32, row_weights[c]) << 16);
                 sum += w_f * x[c];
             }
@@ -491,18 +555,20 @@ pub fn gemvTileF32(
     const rows: usize = dims.rows;
     const cols: usize = dims.cols;
     const Vec8 = @Vector(8, f32);
+    const max_rows = if (row_base >= y.len) 0 else @min(rows, y.len - row_base);
+    const max_cols = @min(cols, x.len);
 
-    for (0..rows) |r| {
+    for (0..max_rows) |r| {
         const row_weights = coded[r * cols .. (r + 1) * cols];
         var acc: Vec8 = @splat(0.0);
         var c: usize = 0;
-        while (c + 8 <= cols) : (c += 8) {
+        while (c + 8 <= max_cols) : (c += 8) {
             const w_v: Vec8 = row_weights[c..][0..8].*;
             const x_v: Vec8 = x[c..][0..8].*;
             acc = @mulAdd(Vec8, w_v, x_v, acc);
         }
         var sum: f32 = @reduce(.Add, acc);
-        while (c < cols) : (c += 1) {
+        while (c < max_cols) : (c += 1) {
             sum += row_weights[c] * x[c];
         }
 
@@ -510,6 +576,154 @@ pub fn gemvTileF32(
             y[row_base + r] += sum;
         } else {
             y[row_base + r] = sum;
+        }
+    }
+}
+
+/// Flat 32768-weight GEMV accumulator for wide-column projections (e.g. down_proj)
+pub fn gemvCellFlat(
+    cell: *const geometry.Cell,
+    t: usize,
+    wpt: usize,
+    r_total: usize,
+    c_total: usize,
+    x: []const f32,
+    y: []f32,
+) void {
+    const payload = &cell.semantic_payload;
+    const meta: *const TileMetadata = @ptrCast(@alignCast(payload.ptr));
+    const coded: [*]const u8 = @ptrCast(&cell.fingerprints);
+    const global_w_start = t * wpt;
+
+    var tile_weights: [32768]f32 = undefined;
+
+    if (meta.quant_bits == 4) {
+        const has_group128 = (meta.custom_flags & FLAG_GROUP128_OUTLIERS) != 0;
+        const group_scales: ?[*]const f16 = if (has_group128)
+            @ptrCast(@alignCast(payload[48..560].ptr))
+        else
+            null;
+
+        if (group_scales) |gs| {
+            for (0..256) |g| {
+                const scale: f32 = @floatCast(gs[g]);
+                const g_bytes = coded[g * 64 .. (g + 1) * 64];
+                for (0..64) |k| {
+                    const b = g_bytes[k];
+                    const q0 = @as(f32, @floatFromInt(b & 0x0F)) - 8.0;
+                    const q1 = @as(f32, @floatFromInt((b >> 4) & 0x0F)) - 8.0;
+                    tile_weights[g * 128 + k * 2 + 0] = q0 * scale;
+                    tile_weights[g * 128 + k * 2 + 1] = q1 * scale;
+                }
+            }
+        } else {
+            const dims: *const TileDims = @ptrCast(@alignCast(payload[32..48].ptr));
+            const scale = dims.scale;
+            const bias = dims.bias;
+            for (0..wpt / 2) |k| {
+                const b = coded[k];
+                const q0 = @as(f32, @floatFromInt(b & 0x0F)) - 8.0;
+                const q1 = @as(f32, @floatFromInt((b >> 4) & 0x0F)) - 8.0;
+                tile_weights[k * 2 + 0] = q0 * scale + bias;
+                tile_weights[k * 2 + 1] = q1 * scale + bias;
+            }
+        }
+
+        // Apply outliers if present in down_aux
+        const down_aux = payload[560..832];
+        const num_outliers = std.mem.readInt(u16, down_aux[0..2], .little);
+        if (num_outliers > 0 and num_outliers <= 64) {
+            const outlier_w_bytes = down_aux[2 .. 2 + 2 * num_outliers];
+            const outlier_w = std.mem.bytesAsSlice(f16, outlier_w_bytes);
+            const outlier_off_bytes = down_aux[130 .. 130 + 2 * num_outliers];
+            const outlier_offsets = std.mem.bytesAsSlice(u16, outlier_off_bytes);
+            for (0..num_outliers) |m| {
+                const off = outlier_offsets[m];
+                if (off < wpt) {
+                    tile_weights[off] = @floatCast(outlier_w[m]);
+                }
+            }
+        }
+    } else if (meta.quant_bits == 2) {
+        const has_group128 = (meta.custom_flags & FLAG_GROUP128_OUTLIERS) != 0;
+        const group_scales: ?[*]const f16 = if (has_group128)
+            @ptrCast(@alignCast(payload[48..560].ptr))
+        else
+            null;
+
+        if (group_scales) |gs| {
+            for (0..256) |g| {
+                const scale: f32 = @floatCast(gs[g]);
+                const g_bytes = coded[g * 32 .. (g + 1) * 32];
+                for (0..32) |k| {
+                    const b = g_bytes[k];
+                    tile_weights[g * 128 + k * 4 + 0] = CODEBOOK_W2[b & 0x03] * scale;
+                    tile_weights[g * 128 + k * 4 + 1] = CODEBOOK_W2[(b >> 2) & 0x03] * scale;
+                    tile_weights[g * 128 + k * 4 + 2] = CODEBOOK_W2[(b >> 4) & 0x03] * scale;
+                    tile_weights[g * 128 + k * 4 + 3] = CODEBOOK_W2[(b >> 6) & 0x03] * scale;
+                }
+            }
+        } else {
+            const dims: *const TileDims = @ptrCast(@alignCast(payload[32..48].ptr));
+            const scale = dims.scale;
+            const bias = dims.bias;
+            for (0..wpt / 4) |k| {
+                const b = coded[k];
+                tile_weights[k * 4 + 0] = CODEBOOK_W2[b & 0x03] * scale + bias;
+                tile_weights[k * 4 + 1] = CODEBOOK_W2[(b >> 2) & 0x03] * scale + bias;
+                tile_weights[k * 4 + 2] = CODEBOOK_W2[(b >> 4) & 0x03] * scale + bias;
+                tile_weights[k * 4 + 3] = CODEBOOK_W2[(b >> 6) & 0x03] * scale + bias;
+            }
+        }
+
+        // Apply outliers if present in down_aux
+        const down_aux = payload[560..832];
+        const num_outliers = std.mem.readInt(u16, down_aux[0..2], .little);
+        if (num_outliers > 0 and num_outliers <= 64) {
+            const outlier_w_bytes = down_aux[2 .. 2 + 2 * num_outliers];
+            const outlier_w = std.mem.bytesAsSlice(f16, outlier_w_bytes);
+            const outlier_off_bytes = down_aux[130 .. 130 + 2 * num_outliers];
+            const outlier_offsets = std.mem.bytesAsSlice(u16, outlier_off_bytes);
+            for (0..num_outliers) |m| {
+                const off = outlier_offsets[m];
+                if (off < wpt) {
+                    tile_weights[off] = @floatCast(outlier_w[m]);
+                }
+            }
+        }
+    } else {
+        @memset(&tile_weights, 0.0);
+    }
+
+    var j: usize = 0;
+    var r = global_w_start / c_total;
+    var c = global_w_start % c_total;
+
+    while (j < wpt and r < r_total) {
+        const seg_len = @min(wpt - j, c_total - c);
+        var dot: f32 = 0.0;
+        const w_slice = tile_weights[j .. j + seg_len];
+        const x_slice = x[c .. c + seg_len];
+
+        var k: usize = 0;
+        const Vec8 = @Vector(8, f32);
+        var acc: Vec8 = @splat(0.0);
+        while (k + 8 <= seg_len) : (k += 8) {
+            const wv: Vec8 = w_slice[k..][0..8].*;
+            const xv: Vec8 = x_slice[k..][0..8].*;
+            acc = @mulAdd(Vec8, wv, xv, acc);
+        }
+        dot = @reduce(.Add, acc);
+        while (k < seg_len) : (k += 1) {
+            dot += w_slice[k] * x_slice[k];
+        }
+        y[r] += dot;
+
+        j += seg_len;
+        c += seg_len;
+        if (c == c_total) {
+            c = 0;
+            r += 1;
         }
     }
 }
@@ -950,6 +1164,25 @@ pub const CHPEEngine = struct {
         if (all_zero) @memset(out, 1.0);
     }
 
+    pub fn unpackBias(self: *const CHPEEngine, tile_idx: usize, out: []f32) void {
+        if (!self.archive_valid or tile_idx >= self.record_count) {
+            @memset(out, 0.0);
+            return;
+        }
+        const tile_raw = self.getTileCodedPtr(tile_idx);
+        if (self.is_raw_fp16) {
+            weight_archive.unpackF16SliceToF32(tile_raw[0 .. out.len * 2], out);
+        } else {
+            const tile_f32: [*]const f32 = @ptrCast(@alignCast(tile_raw));
+            @memcpy(out, tile_f32[0..out.len]);
+        }
+        for (out) |*v| {
+            if (!std.math.isFinite(v.*)) {
+                v.* = 0.0;
+            }
+        }
+    }
+
     pub fn dotSegment(
         self: *const CHPEEngine,
         tile_ptr: [*]const u8,
@@ -1166,21 +1399,32 @@ pub const CHPEEngine = struct {
         }
 
         if (!self.is_raw) {
-            // Polymorphic cell-based execution using self-describing TileDims
-            var row_base: usize = 0;
-            const available_tiles = @min(num_tiles, self.record_count - tile_start);
-            for (0..available_tiles) |t| {
-                if (row_base >= r_total) break;
-                const cell = self.getCellPointer(tile_start + t);
-                const dims: *const TileDims = @ptrCast(@alignCast(cell.semantic_payload[32..48].ptr));
-                if (dims.rows == 0) break;
-                gemvTilePolymorphic(cell, x, y, row_base, accumulate);
-                row_base += dims.rows;
+            // Wide-column projections (e.g. down_proj where c_total = 11008 or 29568)
+            // wrap across rows and are tiled as flat chunks of 32768 weights.
+            if (c_total > 2048) {
+                const wpt: usize = 32768;
+                const available_tiles = @min(num_tiles, self.record_count - tile_start);
+                for (0..available_tiles) |t| {
+                    const cell = self.getCellPointer(tile_start + t);
+                    gemvCellFlat(cell, t, wpt, r_total, c_total, x, y);
+                }
+            } else {
+                // Polymorphic cell-based execution using self-describing TileDims
+                var row_base: usize = 0;
+                const available_tiles = @min(num_tiles, self.record_count - tile_start);
+                for (0..available_tiles) |t| {
+                    if (row_base >= r_total) break;
+                    const cell = self.getCellPointer(tile_start + t);
+                    const dims: *const TileDims = @ptrCast(@alignCast(cell.semantic_payload[32..48].ptr));
+                    if (dims.rows == 0) break;
+                    gemvTilePolymorphic(cell, x, y, row_base, accumulate);
+                    row_base += dims.rows;
+                }
             }
 
             if (bias_tile) |bt| {
                 if (bt < self.record_count) {
-                    self.unpackNorm(bt, self.bias_buf[0..r_total]);
+                    self.unpackBias(bt, self.bias_buf[0..r_total]);
                     for (0..r_total) |r| {
                         y[r] += self.bias_buf[r];
                     }
@@ -1217,7 +1461,7 @@ pub const CHPEEngine = struct {
 
         if (bias_tile) |bt| {
             if (bt < self.record_count) {
-                self.unpackNorm(bt, self.bias_buf[0..r_total]);
+                self.unpackBias(bt, self.bias_buf[0..r_total]);
                 for (0..r_total) |r| {
                     y[r] += self.bias_buf[r];
                 }
@@ -1319,11 +1563,13 @@ pub const CHPEEngine = struct {
         if (!self.is_raw) {
             // Tied embeddings (3B) in cell archive
             var dummy_token_row: [8192]f32 = undefined;
-            const total_emb_tiles = @min(self.record_count, (V + 15) / 16);
-            for (0..total_emb_tiles) |t| {
+            var v: usize = 0;
+            for (0..self.record_count) |t| {
+                if (v >= V) break;
                 const cell = self.getCellPointer(t);
-                for (0..16) |r| {
-                    const v = t * 16 + r;
+                const dims: *const TileDims = @ptrCast(@alignCast(cell.semantic_payload[32..48].ptr));
+                const rpt = if (dims.rows == 0) 16 else dims.rows;
+                for (0..rpt) |r| {
                     if (v >= V) break;
                     unpackEmbedRowCell(cell, r, dummy_token_row[0..D]);
                     var k: usize = 0;
@@ -1339,6 +1585,7 @@ pub const CHPEEngine = struct {
                         sum += self.norm_buf[k] * dummy_token_row[k];
                     }
                     self.logits_buf[v] = sum;
+                    v += 1;
                 }
             }
             return;
@@ -1399,6 +1646,9 @@ pub const CHPEEngine = struct {
 
         // 0. Token Embedding lookup
         self.unpackEmbedRow(token_id, self.hidden);
+        var h0_sq: f32 = 0.0;
+        for (self.hidden) |h| h0_sq += h * h;
+        std.debug.print("Embed norm: {d}\n", .{@sqrt(h0_sq)});
 
         const gqa_group = self.arch.num_attn_heads / self.arch.num_kv_heads;
 
@@ -1479,6 +1729,19 @@ pub const CHPEEngine = struct {
 
             // 9. Down Projection: W_down * mlp_buf -> accumulate into self.hidden residual
             self.gemvLinear(layer_info.down_proj, layer_info.down_tiles, self.mlp_buf, self.hidden, self.arch.hidden_dim, self.arch.intermediate_dim, true, null);
+
+            if (l < 3 or (l >= 8 and l <= 16) or !std.math.isFinite(self.hidden[0])) {
+                var q_sq: f32 = 0.0;
+                for (self.q_buf) |v| q_sq += v * v;
+                var o_sq: f32 = 0.0;
+                for (self.attn_out) |v| o_sq += v * v;
+                var mlp_sq: f32 = 0.0;
+                for (self.mlp_buf) |v| mlp_sq += v * v;
+                var h_sq: f32 = 0.0;
+                for (self.hidden) |v| h_sq += v * v;
+                std.debug.print("L{d}: q_norm={d} o_norm={d} mlp_norm={d} h_norm={d}\n", .{ l, @sqrt(q_sq), @sqrt(o_sq), @sqrt(mlp_sq), @sqrt(h_sq) });
+                if (!std.math.isFinite(h_sq)) break;
+            }
         }
 
         // Final Norm
