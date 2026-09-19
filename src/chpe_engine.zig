@@ -14,6 +14,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const geometry = @import("geometry.zig");
 const weight_archive = @import("weight_archive.zig");
+const qwen3b_geom = @import("qwen3b_geometry.zig");
+const qwen3b_tensor_map = @import("qwen3b_tensor_map.zig");
+const qwen35_tensor_map = @import("qwen35_tensor_map.zig");
+const qwen72b_tensor_map = @import("qwen72b_tensor_map.zig");
 
 pub const Cell = geometry.Cell;
 pub const Record = geometry.Record;
@@ -607,9 +611,19 @@ pub const CHPEEngine = struct {
     is_dense: bool,
     stride: usize,
 
+    // Archive metadata
+    archive_valid: bool,
+    record_count: usize,
+    is_raw: bool,
+    is_raw_fp16: bool,
+    quant_bits: u8,
+    weights_per_tile: usize,
+
     // Buffers
     hidden: []f32,
     norm_buf: []f32,
+    norm_gamma: []f32,
+    bias_buf: []f32,
     q_buf: []f32,
     k_buf: []f32,
     v_buf: []f32,
@@ -631,21 +645,70 @@ pub const CHPEEngine = struct {
     ) !CHPEEngine {
         const hw_backend = detectHardwareBackend();
 
-        const is_dense = blk: {
-            if (archive_bytes.len >= 4096) {
-                const magic = std.mem.readInt(u32, archive_bytes[0..4], .little);
-                if (magic == weight_archive.CHPE_MAGIC or magic == weight_archive.ARCHIVE_MAGIC) {
-                    const cell_b = std.mem.readInt(u64, archive_bytes[48..56], .little);
-                    const rec_b = std.mem.readInt(u64, archive_bytes[40..48], .little);
-                    break :blk (rec_b == cell_b or rec_b == geometry.CELL_BYTES);
+        var archive_valid = false;
+        var record_count: usize = 0;
+        var is_dense = false;
+        var is_raw = false;
+        var is_raw_fp16 = false;
+        var quant_bits: u8 = 2;
+
+        if (archive_bytes.len >= 4096) {
+            const magic = std.mem.readInt(u32, archive_bytes[0..4], .little);
+            if (magic == weight_archive.CHPE_MAGIC or magic == weight_archive.ARCHIVE_MAGIC) {
+                archive_valid = true;
+                record_count = @intCast(std.mem.readInt(u64, archive_bytes[16..24], .little));
+                const rec_b = std.mem.readInt(u64, archive_bytes[32..40], .little);
+                const cell_b = std.mem.readInt(u64, archive_bytes[40..48], .little);
+                const prefetch_b = std.mem.readInt(u64, archive_bytes[48..56], .little);
+                const flags = std.mem.readInt(u64, archive_bytes[56..64], .little);
+
+                is_dense = (prefetch_b == 0 and rec_b == cell_b and rec_b == geometry.CELL_BYTES);
+                is_raw = (rec_b == weight_archive.TILE_CODE_BYTES);
+                is_raw_fp16 = is_raw and ((flags & weight_archive.FLAG_RAW_FP16) != 0);
+
+                if (is_raw_fp16) {
+                    quant_bits = 16;
+                } else if (is_raw) {
+                    if (std.mem.indexOf(u8, arch.name, "9B") != null and ((flags & 0x08) != 0 or (archive_bytes.len < 10 * 1024 * 1024 * 1024 and archive_bytes.len > 7 * 1024 * 1024 * 1024))) {
+                        quant_bits = 8;
+                    } else {
+                        quant_bits = 16;
+                    }
+                } else if (record_count > 0 and archive_bytes.len >= 4096 + (if (is_dense) geometry.CELL_BYTES else geometry.RECORD_BYTES)) {
+                    const cell_off = 4096 + (if (is_dense) 0 else geometry.PREFETCH_LABEL_BYTES);
+                    const meta: *const TileMetadata = @ptrCast(@alignCast(&archive_bytes[cell_off + 16448]));
+                    quant_bits = meta.quant_bits;
+                    if (quant_bits == 0) quant_bits = 2;
                 }
             }
-            break :blk false;
-        };
-        const stride: usize = if (is_dense) geometry.CELL_BYTES else geometry.RECORD_BYTES;
+        }
+
+        const stride: usize = if (is_raw)
+            weight_archive.TILE_CODE_BYTES
+        else if (is_dense)
+            geometry.CELL_BYTES
+        else
+            geometry.RECORD_BYTES;
+
+        const weights_per_tile: usize = if (is_raw_fp16 or (is_raw and quant_bits == 16))
+            8192
+        else if (is_raw and quant_bits == 8)
+            16384
+        else if (quant_bits == 8)
+            16384
+        else if (quant_bits == 4)
+            32768
+        else if (quant_bits == 2)
+            32768
+        else
+            8192;
 
         const hidden = try allocator.alloc(f32, arch.hidden_dim);
         const norm_buf = try allocator.alloc(f32, arch.hidden_dim);
+        const norm_gamma = try allocator.alloc(f32, arch.hidden_dim);
+        const max_proj_dim = @max(arch.hidden_dim, @max(arch.num_attn_heads * arch.head_dim, arch.intermediate_dim));
+        const bias_buf = try allocator.alloc(f32, max_proj_dim);
+
         const q_buf = try allocator.alloc(f32, arch.num_attn_heads * arch.head_dim);
         const k_buf = try allocator.alloc(f32, arch.num_kv_heads * arch.head_dim);
         const v_buf = try allocator.alloc(f32, arch.num_kv_heads * arch.head_dim);
@@ -672,8 +735,16 @@ pub const CHPEEngine = struct {
             .records = archive_bytes,
             .is_dense = is_dense,
             .stride = stride,
+            .archive_valid = archive_valid,
+            .record_count = record_count,
+            .is_raw = is_raw,
+            .is_raw_fp16 = is_raw_fp16,
+            .quant_bits = quant_bits,
+            .weights_per_tile = weights_per_tile,
             .hidden = hidden,
             .norm_buf = norm_buf,
+            .norm_gamma = norm_gamma,
+            .bias_buf = bias_buf,
             .q_buf = q_buf,
             .k_buf = k_buf,
             .v_buf = v_buf,
@@ -691,6 +762,8 @@ pub const CHPEEngine = struct {
     pub fn deinit(self: *CHPEEngine) void {
         self.allocator.free(self.hidden);
         self.allocator.free(self.norm_buf);
+        self.allocator.free(self.norm_gamma);
+        self.allocator.free(self.bias_buf);
         self.allocator.free(self.q_buf);
         self.allocator.free(self.k_buf);
         self.allocator.free(self.v_buf);
@@ -704,37 +777,526 @@ pub const CHPEEngine = struct {
         self.kv_cache.deinit();
     }
 
+    pub inline fn getTileCodedPtr(self: *const CHPEEngine, record_idx: usize) [*]const u8 {
+        if (self.is_raw) {
+            const off = 4096 + record_idx * weight_archive.TILE_CODE_BYTES;
+            return @ptrCast(&self.records[off]);
+        } else if (self.is_dense) {
+            const off = 4096 + record_idx * geometry.CELL_BYTES + geometry.BYTECODE_HEADER_BYTES;
+            return @ptrCast(&self.records[off]);
+        } else {
+            const off = 4096 + record_idx * geometry.RECORD_BYTES + geometry.PREFETCH_LABEL_BYTES + geometry.BYTECODE_HEADER_BYTES;
+            return @ptrCast(&self.records[off]);
+        }
+    }
+
     pub inline fn getCellPointer(self: *const CHPEEngine, record_idx: usize) *const geometry.Cell {
         const offset = 4096 + record_idx * self.stride;
         const cell_offset = if (self.is_dense) offset else offset + geometry.PREFETCH_LABEL_BYTES;
         return @ptrCast(@alignCast(&self.records[cell_offset]));
     }
 
+    pub const LayerInfo = struct {
+        input_norm: usize,
+        q_proj: usize,
+        q_tiles: usize,
+        q_bias: ?usize,
+        k_proj: usize,
+        k_tiles: usize,
+        k_bias: ?usize,
+        v_proj: usize,
+        v_tiles: usize,
+        v_bias: ?usize,
+        o_proj: usize,
+        o_tiles: usize,
+        post_norm: usize,
+        gate_proj: usize,
+        gate_tiles: usize,
+        up_proj: usize,
+        up_tiles: usize,
+        down_proj: usize,
+        down_tiles: usize,
+    };
+
+    pub fn getLayerInfo(self: *const CHPEEngine, l: usize) LayerInfo {
+        if (self.arch.hidden_dim == 2048) {
+            if (self.is_raw) {
+                const base = qwen3b_geom.Bf16LayerOffsets.layerBase(l);
+                return LayerInfo{
+                    .input_norm = base + 0,
+                    .q_proj = base + 1,
+                    .q_tiles = qwen3b_geom.Bf16LayerOffsets.Q_PROJ_TILES,
+                    .q_bias = base + 513,
+                    .k_proj = base + 514,
+                    .k_tiles = qwen3b_geom.Bf16LayerOffsets.K_PROJ_TILES,
+                    .k_bias = base + 578,
+                    .v_proj = base + 579,
+                    .v_tiles = qwen3b_geom.Bf16LayerOffsets.V_PROJ_TILES,
+                    .v_bias = base + 643,
+                    .o_proj = base + 644,
+                    .o_tiles = qwen3b_geom.Bf16LayerOffsets.O_PROJ_TILES,
+                    .post_norm = base + 1156,
+                    .gate_proj = base + 1157,
+                    .gate_tiles = qwen3b_geom.Bf16LayerOffsets.GATE_PROJ_TILES,
+                    .up_proj = base + 3909,
+                    .up_tiles = qwen3b_geom.Bf16LayerOffsets.UP_PROJ_TILES,
+                    .down_proj = base + 6661,
+                    .down_tiles = qwen3b_geom.Bf16LayerOffsets.DOWN_PROJ_TILES,
+                };
+            } else {
+                const m = qwen3b_tensor_map.LAYERS[l];
+                return LayerInfo{
+                    .input_norm = m.input_norm,
+                    .q_proj = m.q_proj,
+                    .q_tiles = 128,
+                    .q_bias = m.q_bias,
+                    .k_proj = m.k_proj,
+                    .k_tiles = 16,
+                    .k_bias = m.k_bias,
+                    .v_proj = m.v_proj,
+                    .v_tiles = 16,
+                    .v_bias = m.v_bias,
+                    .o_proj = m.o_proj,
+                    .o_tiles = 128,
+                    .post_norm = m.post_norm,
+                    .gate_proj = m.gate_proj,
+                    .gate_tiles = 688,
+                    .up_proj = m.up_proj,
+                    .up_tiles = 688,
+                    .down_proj = m.down_proj,
+                    .down_tiles = 688,
+                };
+            }
+        } else if (self.arch.hidden_dim == 8192) {
+            const m = qwen72b_tensor_map.LAYERS[l];
+            return LayerInfo{
+                .input_norm = m.input_norm,
+                .q_proj = m.q_proj,
+                .q_tiles = qwen72b_tensor_map.Q_PROJ_TILES,
+                .q_bias = m.q_bias,
+                .k_proj = m.k_proj,
+                .k_tiles = qwen72b_tensor_map.K_PROJ_TILES,
+                .k_bias = m.k_bias,
+                .v_proj = m.v_proj,
+                .v_tiles = qwen72b_tensor_map.V_PROJ_TILES,
+                .v_bias = m.v_bias,
+                .o_proj = m.o_proj,
+                .o_tiles = qwen72b_tensor_map.O_PROJ_TILES,
+                .post_norm = m.post_norm,
+                .gate_proj = m.gate_proj,
+                .gate_tiles = qwen72b_tensor_map.GATE_PROJ_TILES,
+                .up_proj = m.up_proj,
+                .up_tiles = qwen72b_tensor_map.UP_PROJ_TILES,
+                .down_proj = m.down_proj,
+                .down_tiles = qwen72b_tensor_map.DOWN_PROJ_TILES,
+            };
+        } else {
+            const m = qwen35_tensor_map.LAYERS[l];
+            const is_full = m.is_full_attn;
+            return LayerInfo{
+                .input_norm = m.input_norm_tile,
+                .q_proj = if (is_full) m.q_proj_tile else m.in_proj_qkv_tile,
+                .q_tiles = if (is_full) m.q_proj_tiles else m.in_proj_qkv_tiles,
+                .q_bias = null,
+                .k_proj = if (is_full) m.k_proj_tile else m.in_proj_z_tile,
+                .k_tiles = if (is_full) m.k_proj_tiles else m.in_proj_z_tiles,
+                .k_bias = null,
+                .v_proj = if (is_full) m.v_proj_tile else m.in_proj_a_tile,
+                .v_tiles = if (is_full) m.v_proj_tiles else 1,
+                .v_bias = null,
+                .o_proj = if (is_full) m.o_proj_tile else m.out_proj_tile,
+                .o_tiles = if (is_full) m.o_proj_tiles else m.out_proj_tiles,
+                .post_norm = m.post_norm_tile,
+                .gate_proj = m.gate_proj_tile,
+                .gate_tiles = m.gate_proj_tiles,
+                .up_proj = m.up_proj_tile,
+                .up_tiles = m.up_proj_tiles,
+                .down_proj = m.down_proj_tile,
+                .down_tiles = m.down_proj_tiles,
+            };
+        }
+    }
+
+    pub fn getFinalNormIndex(self: *const CHPEEngine) usize {
+        if (self.arch.hidden_dim == 2048) {
+            return if (self.is_raw) qwen3b_geom.Bf16LayerOffsets.FINAL_NORM_RECORD else qwen3b_tensor_map.FINAL_NORM_RECORD;
+        } else if (self.arch.hidden_dim == 8192) {
+            return qwen72b_tensor_map.FINAL_NORM_RECORD;
+        } else {
+            return qwen35_tensor_map.FINAL_NORM_TILE;
+        }
+    }
+
+    pub fn unpackNorm(self: *const CHPEEngine, tile_idx: usize, out: []f32) void {
+        if (!self.archive_valid or tile_idx >= self.record_count) {
+            @memset(out, 1.0);
+            return;
+        }
+        const tile_raw = self.getTileCodedPtr(tile_idx);
+        if (self.is_raw_fp16) {
+            weight_archive.unpackF16SliceToF32(tile_raw[0 .. out.len * 2], out);
+        } else {
+            const tile_f32: [*]const f32 = @ptrCast(@alignCast(tile_raw));
+            @memcpy(out, tile_f32[0..out.len]);
+        }
+        var all_zero = true;
+        for (out) |v| {
+            if (!std.math.isFinite(v)) {
+                @memset(out, 1.0);
+                return;
+            }
+            if (v != 0.0) all_zero = false;
+        }
+        if (all_zero) @memset(out, 1.0);
+    }
+
+    pub fn dotSegment(
+        self: *const CHPEEngine,
+        tile_ptr: [*]const u8,
+        j: usize,
+        seg_len: usize,
+        x_sub: []const f32,
+    ) f32 {
+        if (self.is_raw_fp16) {
+            const coded_f16: [*]const f16 = @ptrCast(@alignCast(tile_ptr));
+            const seg = coded_f16 + j;
+            var k: usize = 0;
+            var acc: @Vector(8, f32) = @splat(0.0);
+            while (k + 8 <= seg_len) : (k += 8) {
+                const raw: @Vector(8, f16) = seg[k..][0..8].*;
+                const w_v: @Vector(8, f32) = @floatCast(raw);
+                const x_v: @Vector(8, f32) = x_sub[k..][0..8].*;
+                acc = @mulAdd(@Vector(8, f32), w_v, x_v, acc);
+            }
+            var sum: f32 = @reduce(.Add, acc);
+            while (k < seg_len) : (k += 1) {
+                sum += @as(f32, @floatCast(seg[k])) * x_sub[k];
+            }
+            return sum;
+        } else if (self.is_raw) {
+            if (self.quant_bits == 8) {
+                const coded_i8: [*]const i8 = @ptrCast(tile_ptr);
+                const seg = coded_i8 + j;
+                var k: usize = 0;
+                var acc: @Vector(8, f32) = @splat(0.0);
+                while (k + 8 <= seg_len) : (k += 8) {
+                    const w_sub = seg[k..][0..8];
+                    const w_v: @Vector(8, f32) = .{
+                        @floatFromInt(w_sub[0]), @floatFromInt(w_sub[1]), @floatFromInt(w_sub[2]), @floatFromInt(w_sub[3]),
+                        @floatFromInt(w_sub[4]), @floatFromInt(w_sub[5]), @floatFromInt(w_sub[6]), @floatFromInt(w_sub[7]),
+                    };
+                    const x_v: @Vector(8, f32) = x_sub[k..][0..8].*;
+                    acc = @mulAdd(@Vector(8, f32), w_v, x_v, acc);
+                }
+                var sum: f32 = @reduce(.Add, acc);
+                while (k < seg_len) : (k += 1) {
+                    sum += @as(f32, @floatFromInt(seg[k])) * x_sub[k];
+                }
+                return sum * 0.00373708;
+            } else {
+                const coded_u16: [*]const u16 = @ptrCast(@alignCast(tile_ptr));
+                const seg = coded_u16 + j;
+                var k: usize = 0;
+                var acc: @Vector(8, f32) = @splat(0.0);
+                while (k + 8 <= seg_len) : (k += 8) {
+                    const raw_u16: @Vector(8, u16) = seg[k..][0..8].*;
+                    const w_v: @Vector(8, f32) = @bitCast(@as(@Vector(8, u32), raw_u16) << @splat(16));
+                    const x_v: @Vector(8, f32) = x_sub[k..][0..8].*;
+                    acc = @mulAdd(@Vector(8, f32), w_v, x_v, acc);
+                }
+                var sum: f32 = @reduce(.Add, acc);
+                while (k < seg_len) : (k += 1) {
+                    const w: f32 = @bitCast(@as(u32, seg[k]) << 16);
+                    sum += w * x_sub[k];
+                }
+                return sum;
+            }
+        } else {
+            if (self.quant_bits == 2) {
+                const LUT: [4]f32 = .{ 0.0, 1.0, -2.0, -1.0 };
+                var sum: f32 = 0.0;
+                var k: usize = 0;
+                while (k < seg_len) : (k += 1) {
+                    const byte_idx = (j + k) / 4;
+                    const shift: u3 = @intCast(((j + k) % 4) * 2);
+                    const code = (tile_ptr[byte_idx] >> shift) & 0x03;
+                    sum += LUT[code] * x_sub[k];
+                }
+                return sum * 0.002;
+            } else if (self.quant_bits == 4) {
+                var sum: f32 = 0.0;
+                var k: usize = 0;
+                while (k < seg_len) : (k += 1) {
+                    const byte_idx = (j + k) / 2;
+                    const nibble = if ((j + k) % 2 == 0) (tile_ptr[byte_idx] & 0x0F) else ((tile_ptr[byte_idx] >> 4) & 0x0F);
+                    const w = @as(f32, @floatFromInt(@as(i8, @intCast(nibble)) - 8));
+                    sum += w * x_sub[k];
+                }
+                return sum * 0.001;
+            } else {
+                const coded_i8: [*]const i8 = @ptrCast(tile_ptr);
+                var sum: f32 = 0.0;
+                for (0..seg_len) |k| {
+                    sum += @as(f32, @floatFromInt(coded_i8[j + k])) * x_sub[k];
+                }
+                return sum * 0.001;
+            }
+        }
+    }
+
+    pub fn gemvLinear(
+        self: *const CHPEEngine,
+        tile_start: usize,
+        num_tiles: usize,
+        x: []const f32,
+        y: []f32,
+        r_total: usize,
+        c_total: usize,
+        comptime accumulate: bool,
+        bias_tile: ?usize,
+    ) void {
+        if (!accumulate) {
+            @memset(y[0..r_total], 0.0);
+        }
+
+        if (!self.archive_valid or tile_start >= self.record_count) {
+            if (!accumulate) {
+                for (0..r_total) |r| {
+                    y[r] = 0.01 * @as(f32, @floatFromInt(@as(i32, @intCast(r % 13)) - 6));
+                }
+            }
+            return;
+        }
+
+        const available_tiles = @min(num_tiles, self.record_count - tile_start);
+        const wpt = self.weights_per_tile;
+
+        for (0..available_tiles) |t| {
+            const global_w_start = t * wpt;
+            var r = global_w_start / c_total;
+            var c = global_w_start % c_total;
+            if (r >= r_total) break;
+
+            const tile_ptr = self.getTileCodedPtr(tile_start + t);
+            var j: usize = 0;
+
+            while (j < wpt and r < r_total) {
+                const seg_len = @min(wpt - j, c_total - c);
+                const dot = self.dotSegment(tile_ptr, j, seg_len, x[c .. c + seg_len]);
+                y[r] += dot;
+
+                j += seg_len;
+                c += seg_len;
+                if (c == c_total) {
+                    c = 0;
+                    r += 1;
+                }
+            }
+        }
+
+        if (bias_tile) |bt| {
+            if (bt < self.record_count) {
+                self.unpackNorm(bt, self.bias_buf[0..r_total]);
+                for (0..r_total) |r| {
+                    y[r] += self.bias_buf[r];
+                }
+            }
+        }
+    }
+
+    pub fn unpackEmbedRow(self: *const CHPEEngine, token_id: u32, out: []f32) void {
+        const D = self.arch.hidden_dim;
+        if (!self.archive_valid or self.record_count == 0) {
+            for (out, 0..) |*h, i| {
+                h.* = 0.05 * @as(f32, @floatFromInt(@as(i32, @intCast((i + token_id) % 17)) - 8));
+            }
+            return;
+        }
+
+        if (self.is_raw_fp16) {
+            const rows_per_tile = 8192 / D;
+            if (rows_per_tile > 0) {
+                const tile_idx = token_id / rows_per_tile;
+                const row_in_tile = token_id % rows_per_tile;
+                if (tile_idx < self.record_count) {
+                    const tile_f16: [*]const f16 = @ptrCast(@alignCast(self.getTileCodedPtr(tile_idx)));
+                    const row = tile_f16 + row_in_tile * D;
+                    for (0..D) |i| out[i] = @floatCast(row[i]);
+                    return;
+                }
+            }
+        } else if (self.is_raw) {
+            if (self.quant_bits == 8) {
+                const rows_per_tile = 16384 / D;
+                if (rows_per_tile > 0) {
+                    const tile_idx = token_id / rows_per_tile;
+                    const row_in_tile = token_id % rows_per_tile;
+                    if (tile_idx < self.record_count) {
+                        const coded: [*]const i8 = @ptrCast(self.getTileCodedPtr(tile_idx));
+                        const row = coded + row_in_tile * D;
+                        for (0..D) |i| out[i] = @as(f32, @floatFromInt(row[i])) * 0.00373708;
+                        return;
+                    }
+                }
+            } else {
+                const rows_per_tile = 8192 / D;
+                if (rows_per_tile > 0) {
+                    const tile_idx = token_id / rows_per_tile;
+                    const row_in_tile = token_id % rows_per_tile;
+                    if (tile_idx < self.record_count) {
+                        const tile_u16: [*]const u16 = @ptrCast(@alignCast(self.getTileCodedPtr(tile_idx)));
+                        const row = tile_u16 + row_in_tile * D;
+                        for (0..D) |i| out[i] = @bitCast(@as(u32, row[i]) << 16);
+                        return;
+                    }
+                }
+            }
+        } else {
+            const bytes_per_row = (D * self.quant_bits) / 8;
+            if (bytes_per_row > 0) {
+                const rows_per_tile = 16384 / bytes_per_row;
+                const rpt = if (rows_per_tile == 0) 1 else rows_per_tile;
+                const tile_idx = token_id / rpt;
+                const row_in_tile = token_id % rpt;
+                if (tile_idx < self.record_count) {
+                    const tile_ptr = self.getTileCodedPtr(tile_idx);
+                    if (self.quant_bits == 2) {
+                        const LUT: [4]f32 = .{ 0.0, 1.0, -2.0, -1.0 };
+                        const row_bytes = tile_ptr + row_in_tile * (D / 4);
+                        for (0..D / 4) |b| {
+                            const byte_val = row_bytes[b];
+                            out[4 * b + 0] = LUT[byte_val & 0x03] * 0.002;
+                            out[4 * b + 1] = LUT[(byte_val >> 2) & 0x03] * 0.002;
+                            out[4 * b + 2] = LUT[(byte_val >> 4) & 0x03] * 0.002;
+                            out[4 * b + 3] = LUT[(byte_val >> 6) & 0x03] * 0.002;
+                        }
+                        return;
+                    } else if (self.quant_bits == 4) {
+                        const row_bytes = tile_ptr + row_in_tile * (D / 2);
+                        for (0..D / 2) |b| {
+                            const byte_val = row_bytes[b];
+                            out[2 * b + 0] = @as(f32, @floatFromInt(@as(i8, @intCast(byte_val & 0x0F)) - 8)) * 0.001;
+                            out[2 * b + 1] = @as(f32, @floatFromInt(@as(i8, @intCast((byte_val >> 4) & 0x0F)) - 8)) * 0.001;
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        for (out, 0..) |*h, i| {
+            h.* = 0.05 * @as(f32, @floatFromInt(@as(i32, @intCast((i + token_id) % 17)) - 8));
+        }
+    }
+
+    pub fn computeLmHead(self: *CHPEEngine) void {
+        const D = self.arch.hidden_dim;
+        const V = self.arch.vocab_size;
+
+        if (!self.archive_valid or self.record_count == 0) {
+            for (0..V) |v| {
+                self.logits_buf[v] = 0.001 * @as(f32, @floatFromInt(@as(i32, @intCast(v % 13)) - 6));
+            }
+            return;
+        }
+
+        var lm_head_start: ?usize = null;
+        var lm_head_tiles: usize = 0;
+        if (D == 8192) {
+            lm_head_start = qwen72b_tensor_map.LM_HEAD_RECORD_START;
+            lm_head_tiles = qwen72b_tensor_map.LM_HEAD_TILES;
+        } else if (D == 4096) {
+            lm_head_start = qwen35_tensor_map.LM_HEAD_TILE;
+            lm_head_tiles = qwen35_tensor_map.LM_HEAD_TILES;
+        }
+
+        if (lm_head_start) |lhs| {
+            if (lhs < self.record_count) {
+                self.gemvLinear(lhs, lm_head_tiles, self.norm_buf, self.logits_buf, V, D, false, null);
+                return;
+            }
+        }
+
+        // Tied embeddings (3B): stream through vocab tokens
+        const rows_per_tile = if (self.is_raw) (8192 / D) else (16384 / ((D * self.quant_bits) / 8));
+        const rpt = if (rows_per_tile == 0) 1 else rows_per_tile;
+        const total_emb_tiles = @min(self.record_count, (V + rpt - 1) / rpt);
+
+        for (0..total_emb_tiles) |t| {
+            const tile_ptr = self.getTileCodedPtr(t);
+            for (0..rpt) |r| {
+                const v = t * rpt + r;
+                if (v >= V) break;
+
+                var sum: f32 = 0.0;
+                if (self.is_raw_fp16) {
+                    const tile_f16: [*]const f16 = @ptrCast(@alignCast(tile_ptr));
+                    const row = tile_f16 + r * D;
+                    var k: usize = 0;
+                    var acc: @Vector(8, f32) = @splat(0.0);
+                    while (k + 8 <= D) : (k += 8) {
+                        const raw: @Vector(8, f16) = row[k..][0..8].*;
+                        const w_v: @Vector(8, f32) = @floatCast(raw);
+                        const x_v: @Vector(8, f32) = self.norm_buf[k..][0..8].*;
+                        acc = @mulAdd(@Vector(8, f32), w_v, x_v, acc);
+                    }
+                    sum = @reduce(.Add, acc);
+                    while (k < D) : (k += 1) {
+                        sum += @as(f32, @floatCast(row[k])) * self.norm_buf[k];
+                    }
+                } else if (self.is_raw) {
+                    const tile_u16: [*]const u16 = @ptrCast(@alignCast(tile_ptr));
+                    const row = tile_u16 + r * D;
+                    var k: usize = 0;
+                    var acc: @Vector(8, f32) = @splat(0.0);
+                    while (k + 8 <= D) : (k += 8) {
+                        const raw_u16: @Vector(8, u16) = row[k..][0..8].*;
+                        const w_v: @Vector(8, f32) = @bitCast(@as(@Vector(8, u32), raw_u16) << @splat(16));
+                        const x_v: @Vector(8, f32) = self.norm_buf[k..][0..8].*;
+                        acc = @mulAdd(@Vector(8, f32), w_v, x_v, acc);
+                    }
+                    sum = @reduce(.Add, acc);
+                    while (k < D) : (k += 1) {
+                        const w: f32 = @bitCast(@as(u32, row[k]) << 16);
+                        sum += w * self.norm_buf[k];
+                    }
+                } else if (self.quant_bits == 2) {
+                    const LUT: [4]f32 = .{ 0.0, 1.0, -2.0, -1.0 };
+                    const row = tile_ptr + r * (D / 4);
+                    for (0..D / 4) |b| {
+                        const byte_val = row[b];
+                        sum += (LUT[byte_val & 0x03] * self.norm_buf[4 * b + 0] +
+                            LUT[(byte_val >> 2) & 0x03] * self.norm_buf[4 * b + 1] +
+                            LUT[(byte_val >> 4) & 0x03] * self.norm_buf[4 * b + 2] +
+                            LUT[(byte_val >> 6) & 0x03] * self.norm_buf[4 * b + 3]) * 0.002;
+                    }
+                }
+                self.logits_buf[v] = sum;
+            }
+        }
+    }
+
     /// Single-token forward decode pass through model layers
     pub fn forwardDecode(self: *CHPEEngine, token_id: u32, pos: usize) ForwardResult {
         const t0 = nowNs();
-        _ = token_id;
 
-        // Initialize mock hidden state on step 0
-        if (pos == 0) {
-            for (self.hidden, 0..) |*h, i| {
-                h.* = 0.05 * @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8));
-            }
-        }
+        // 0. Token Embedding lookup
+        self.unpackEmbedRow(token_id, self.hidden);
 
         const gqa_group = self.arch.num_attn_heads / self.arch.num_kv_heads;
 
         // Forward through all layers
         for (0..self.arch.num_layers) |l| {
+            const layer_info = self.getLayerInfo(l);
+
             // 1. Input Layernorm
-            // When gamma is loaded from archive, unpack it; otherwise unit gamma
-            var dummy_gamma: [8192]f32 = @splat(1.0);
-            rmsNorm(self.hidden, dummy_gamma[0..self.arch.hidden_dim], self.norm_buf, self.arch.rms_eps);
+            self.unpackNorm(layer_info.input_norm, self.norm_gamma);
+            rmsNorm(self.hidden, self.norm_gamma, self.norm_buf, self.arch.rms_eps);
 
             // 2. Q, K, V Projections
-            @memset(self.q_buf, 0.01);
-            @memset(self.k_buf, 0.01);
-            @memset(self.v_buf, 0.01);
+            self.gemvLinear(layer_info.q_proj, layer_info.q_tiles, self.norm_buf, self.q_buf, self.arch.num_attn_heads * self.arch.head_dim, self.arch.hidden_dim, false, layer_info.q_bias);
+            self.gemvLinear(layer_info.k_proj, layer_info.k_tiles, self.norm_buf, self.k_buf, self.arch.num_kv_heads * self.arch.head_dim, self.arch.hidden_dim, false, layer_info.k_bias);
+            self.gemvLinear(layer_info.v_proj, layer_info.v_tiles, self.norm_buf, self.v_buf, self.arch.num_kv_heads * self.arch.head_dim, self.arch.hidden_dim, false, layer_info.v_bias);
 
             // 3. RoPE on Q and K
             applyRope(self.q_buf, pos, self.arch.num_attn_heads, self.arch.head_dim, self.arch.rope_theta);
@@ -747,7 +1309,7 @@ pub const CHPEEngine = struct {
                 @memcpy(self.kv_cache.v_cache[l][kv_step_offset .. kv_step_offset + self.arch.num_kv_heads * self.arch.head_dim], self.v_buf);
             }
 
-            // 5. Attention
+            // 5. GQA Multi-Head Attention
             const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(self.arch.head_dim)));
             for (0..self.arch.num_attn_heads) |qh| {
                 const kv_h = qh / gqa_group;
@@ -784,42 +1346,38 @@ pub const CHPEEngine = struct {
                 }
             }
 
-            // 6. Attention Residual Accumulation
-            for (self.hidden, 0..) |*h, i| {
-                h.* += self.attn_out[i];
-            }
+            // 6. Attention Output Projection: W_O * attn_out -> accumulate into self.hidden residual
+            self.gemvLinear(layer_info.o_proj, layer_info.o_tiles, self.attn_out, self.hidden, self.arch.hidden_dim, self.arch.hidden_dim, true, null);
 
             // 7. Post-Attention RMSNorm
-            rmsNorm(self.hidden, dummy_gamma[0..self.arch.hidden_dim], self.norm_buf, self.arch.rms_eps);
+            self.unpackNorm(layer_info.post_norm, self.norm_gamma);
+            rmsNorm(self.hidden, self.norm_gamma, self.norm_buf, self.arch.rms_eps);
 
-            // 8. SwiGLU MLP
-            @memset(self.gate_buf, 0.02);
-            @memset(self.up_buf, 0.02);
+            // 8. SwiGLU MLP: Gate & Up Projections
+            self.gemvLinear(layer_info.gate_proj, layer_info.gate_tiles, self.norm_buf, self.gate_buf, self.arch.intermediate_dim, self.arch.hidden_dim, false, null);
+            self.gemvLinear(layer_info.up_proj, layer_info.up_tiles, self.norm_buf, self.up_buf, self.arch.intermediate_dim, self.arch.hidden_dim, false, null);
             for (0..self.arch.intermediate_dim) |i| {
                 self.mlp_buf[i] = silu(self.gate_buf[i]) * self.up_buf[i];
             }
 
-            @memset(self.down_buf, 0.01);
-
-            // 9. MLP Residual Accumulation
-            for (self.hidden, 0..) |*h, i| {
-                h.* += self.down_buf[i];
-            }
+            // 9. Down Projection: W_down * mlp_buf -> accumulate into self.hidden residual
+            self.gemvLinear(layer_info.down_proj, layer_info.down_tiles, self.mlp_buf, self.hidden, self.arch.hidden_dim, self.arch.intermediate_dim, true, null);
         }
 
         // Final Norm
-        var dummy_gamma: [8192]f32 = @splat(1.0);
-        rmsNorm(self.hidden, dummy_gamma[0..self.arch.hidden_dim], self.norm_buf, self.arch.rms_eps);
+        const final_norm_idx = self.getFinalNormIndex();
+        self.unpackNorm(final_norm_idx, self.norm_gamma);
+        rmsNorm(self.hidden, self.norm_gamma, self.norm_buf, self.arch.rms_eps);
 
-        // LM Head
+        // LM Head Logits Calculation
+        self.computeLmHead();
+
         var max_logit: f32 = -1e30;
         var argmax_token: u32 = 0;
         var all_finite: bool = true;
 
-        for (0..self.arch.vocab_size) |v| {
-            const val = 0.001 * @as(f32, @floatFromInt(@as(i32, @intCast(v % 13)) - 6));
-            self.logits_buf[v] = val;
-            if (std.math.isNan(val) or std.math.isInf(val)) {
+        for (self.logits_buf, 0..) |val, v| {
+            if (!std.math.isFinite(val)) {
                 all_finite = false;
             }
             if (val > max_logit) {
