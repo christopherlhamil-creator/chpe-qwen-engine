@@ -1147,9 +1147,14 @@ pub const CHPEEngine = struct {
             return;
         }
         const tile_raw = self.getTileCodedPtr(tile_idx);
-        if (self.is_raw_fp16) {
-            weight_archive.unpackF16SliceToF32(tile_raw[0 .. out.len * 2], out);
+        if (self.arch.hidden_dim == 4096 and self.is_raw) {
+            // Qwen3.5-9B stores preserved 1D tensors (norms) as BF16
+            const tile_u16: [*]const u16 = @ptrCast(@alignCast(tile_raw));
+            for (0..out.len) |i| {
+                out[i] = @bitCast(@as(u32, tile_u16[i]) << 16);
+            }
         } else {
+            // Qwen2.5-3B (both BF16 and FP16 raw, and w2/w2f64 quant_bits=32) stores norms as uncompressed FP32
             const tile_f32: [*]const f32 = @ptrCast(@alignCast(tile_raw));
             @memcpy(out, tile_f32[0..out.len]);
         }
@@ -1170,8 +1175,11 @@ pub const CHPEEngine = struct {
             return;
         }
         const tile_raw = self.getTileCodedPtr(tile_idx);
-        if (self.is_raw_fp16) {
-            weight_archive.unpackF16SliceToF32(tile_raw[0 .. out.len * 2], out);
+        if (self.arch.hidden_dim == 4096 and self.is_raw) {
+            const tile_u16: [*]const u16 = @ptrCast(@alignCast(tile_raw));
+            for (0..out.len) |i| {
+                out[i] = @bitCast(@as(u32, tile_u16[i]) << 16);
+            }
         } else {
             const tile_f32: [*]const f32 = @ptrCast(@alignCast(tile_raw));
             @memcpy(out, tile_f32[0..out.len]);
@@ -1303,7 +1311,7 @@ pub const CHPEEngine = struct {
         }
 
         if (meta.quant_bits == 2) {
-            if (row_in_tile >= 32) return;
+            if (row_in_tile >= 16) return;
             const group_scales_raw: [*]const f16 = @ptrCast(@alignCast(payload[48..560].ptr));
             const coded: [*]const u8 = @ptrCast(&cell.fingerprints);
             const row_bytes = coded[row_in_tile * (D / 4) .. (row_in_tile + 1) * (D / 4)];
@@ -1321,6 +1329,17 @@ pub const CHPEEngine = struct {
                     out_g[4 * j + 1] = LUT[(b >> 2) & 0x03] * scale;
                     out_g[4 * j + 2] = LUT[(b >> 4) & 0x03] * scale;
                     out_g[4 * j + 3] = LUT[(b >> 6) & 0x03] * scale;
+                }
+            }
+
+            if ((meta.custom_flags & FLAG_GROUP128_OUTLIERS) != 0) {
+                const outlier_w_raw: [*]const f16 = @ptrCast(@alignCast(payload[560..816].ptr));
+                const outlier_cols_raw: [*]const u16 = @ptrCast(@alignCast(payload[816..832].ptr));
+                inline for (0..8) |k| {
+                    const col_idx = outlier_cols_raw[k];
+                    if (col_idx < D) {
+                        out[col_idx] = @floatCast(outlier_w_raw[row_in_tile * 8 + k]);
+                    }
                 }
             }
             return;
@@ -1659,6 +1678,7 @@ pub const CHPEEngine = struct {
             // 1. Input Layernorm
             self.unpackNorm(layer_info.input_norm, self.norm_gamma);
             rmsNorm(self.hidden, self.norm_gamma, self.norm_buf, self.arch.rms_eps);
+
 
             // 2. Q, K, V Projections
             self.gemvLinear(layer_info.q_proj, layer_info.q_tiles, self.norm_buf, self.q_buf, self.arch.num_attn_heads * self.arch.head_dim, self.arch.hidden_dim, false, layer_info.q_bias);

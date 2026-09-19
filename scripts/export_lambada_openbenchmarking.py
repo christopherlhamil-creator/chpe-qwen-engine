@@ -24,21 +24,40 @@ HOME_DIR = Path("/home/christopherhamil")
 PTS_RESULTS_DIR = HOME_DIR / ".phoronix-test-suite" / "test-results"
 EVAL_JSON = REPO_ROOT / "run" / "lambada_chpe_eval.json"
 
-TEST_ID = "2609164-NE-CHPELAMB82"
-TITLE = "Team CHPE - ARMv8 Neoverse-N1 LAMBADA Discourse Fidelity & Substrate Inference"
-DESCRIPTION = (
-    "OpenBenchmarking.org Empirical Submission by Team CHPE. Zero-shot LAMBADA discourse "
-    "accuracy, perplexity, cache cliffs, memory bus saturation, and native CHPE forward engine metrics."
-)
-SYSTEM_IDENTIFIER = "Team CHPE (Neoverse-N1)"
-HARDWARE_DESC = (
-    "Processor: ARMv8 Neoverse-N1 (4 Cores), Motherboard: KVM Google Compute Engine, "
-    "Memory: 1 x 16GB RAM, Disk: 11GB nvme_card-pd, Network: Google Compute Engine Virtual"
-)
-SOFTWARE_DESC = (
-    "OS: Ubuntu 22.04, Kernel: 6.8.0-1066-gcp (aarch64), Compiler: GCC 11.4.0 + Zig 0.17.0-dev, "
-    "File-System: ext4, System Layer: KVM"
-)
+import platform
+
+if platform.machine() == "x86_64":
+    TEST_ID = "2609191-ZN-CHPELAMB77"
+    TITLE = "Team CHPE - AMD Zen 4 AVX-512 LAMBADA Discourse Fidelity & Substrate Inference"
+    DESCRIPTION = (
+        "OpenBenchmarking.org Empirical Submission by Team CHPE. Zero-shot LAMBADA discourse "
+        "accuracy, perplexity, cache cliffs, memory bus saturation, and native CHPE forward engine metrics on Brandys Zen 4."
+    )
+    SYSTEM_IDENTIFIER = "Team CHPE (Brandys Zen 4)"
+    HARDWARE_DESC = (
+        "Processor: AMD Ryzen 7 8700F (8 Cores / 16 Threads, Zen 4, AVX-512 VNNI), Motherboard: Micro-Star International B650, "
+        "Memory: 32GB DDR5-5600, GPU: AMD Radeon RX 7700 XT 12GB (gfx1101)"
+    )
+    SOFTWARE_DESC = (
+        f"OS: Linux, Kernel: {platform.release()}, Compiler: Clang 17 + Zig 0.17.0-dev, "
+        "File-System: ext4, System Layer: Bare Metal"
+    )
+else:
+    TEST_ID = "2609164-NE-CHPELAMB82"
+    TITLE = "Team CHPE - ARMv8 Neoverse-N1 LAMBADA Discourse Fidelity & Substrate Inference"
+    DESCRIPTION = (
+        "OpenBenchmarking.org Empirical Submission by Team CHPE. Zero-shot LAMBADA discourse "
+        "accuracy, perplexity, cache cliffs, memory bus saturation, and native CHPE forward engine metrics."
+    )
+    SYSTEM_IDENTIFIER = "Team CHPE (Neoverse-N1)"
+    HARDWARE_DESC = (
+        "Processor: ARMv8 Neoverse-N1 (4 Cores), Motherboard: KVM Google Compute Engine, "
+        "Memory: 1 x 16GB RAM, Disk: 11GB nvme_card-pd, Network: Google Compute Engine Virtual"
+    )
+    SOFTWARE_DESC = (
+        "OS: Ubuntu 22.04, Kernel: 6.8.0-1066-gcp (aarch64), Compiler: GCC 11.4.0 + Zig 0.17.0-dev, "
+        "File-System: ext4, System Layer: KVM"
+    )
 
 SYSTEM_JSON = {
     "compiler-configuration": "--build=aarch64-linux-gnu --enable-languages=c,c++,go --host=aarch64-linux-gnu --target=aarch64-linux-gnu -v",
