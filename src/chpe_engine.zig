@@ -1044,6 +1044,103 @@ pub const CHPEEngine = struct {
         }
     }
 
+    pub fn unpackEmbedRowCell(cell: *const geometry.Cell, row_in_tile: usize, out: []f32) void {
+        const payload = &cell.semantic_payload;
+        const meta: *const TileMetadata = @ptrCast(@alignCast(payload.ptr));
+        const D = out.len;
+
+        if (meta.quant_bits == 8) {
+            if (row_in_tile >= 8) return;
+            const group_scales_raw: [*]const f16 = @ptrCast(@alignCast(payload[48..304].ptr));
+            const coded: [*]const u8 = @ptrCast(&cell.fingerprints);
+            const row_bytes = coded[row_in_tile * D .. (row_in_tile + 1) * D];
+            const num_groups = D / 128;
+
+            for (0..num_groups) |g| {
+                const scale: f32 = @floatCast(group_scales_raw[row_in_tile * num_groups + g]);
+                const g_bytes = row_bytes[g * 128 .. (g + 1) * 128];
+                const out_g = out[g * 128 .. (g + 1) * 128];
+
+                for (0..128) |j| {
+                    const w_i8: i8 = @bitCast(g_bytes[j]);
+                    out_g[j] = @as(f32, @floatFromInt(w_i8)) * scale;
+                }
+            }
+            return;
+        }
+
+        if (meta.quant_bits == 2) {
+            if (row_in_tile >= 32) return;
+            const group_scales_raw: [*]const f16 = @ptrCast(@alignCast(payload[48..560].ptr));
+            const coded: [*]const u8 = @ptrCast(&cell.fingerprints);
+            const row_bytes = coded[row_in_tile * (D / 4) .. (row_in_tile + 1) * (D / 4)];
+            const LUT: [4]f32 = .{ 0.0, 1.0, -2.0, -1.0 };
+            const num_groups = D / 128;
+
+            for (0..num_groups) |g| {
+                const scale: f32 = @floatCast(group_scales_raw[row_in_tile * num_groups + g]);
+                const g_bytes = row_bytes[g * 32 .. (g + 1) * 32];
+                const out_g = out[g * 128 .. (g + 1) * 128];
+
+                for (0..32) |j| {
+                    const b = g_bytes[j];
+                    out_g[4 * j + 0] = LUT[b & 0x03] * scale;
+                    out_g[4 * j + 1] = LUT[(b >> 2) & 0x03] * scale;
+                    out_g[4 * j + 2] = LUT[(b >> 4) & 0x03] * scale;
+                    out_g[4 * j + 3] = LUT[(b >> 6) & 0x03] * scale;
+                }
+            }
+            return;
+        }
+
+        if ((meta.custom_flags & FLAG_GROUP128_OUTLIERS) != 0 or meta.quant_bits == 4) {
+            if (row_in_tile >= 16) return;
+            const group_scales_raw: [*]const f16 = @ptrCast(@alignCast(payload[48..560].ptr));
+            const coded: [*]const u8 = @ptrCast(&cell.fingerprints);
+            const row_bytes = coded[row_in_tile * (D / 2) .. (row_in_tile + 1) * (D / 2)];
+            const num_groups = D / 128;
+
+            for (0..num_groups) |g| {
+                const scale: f32 = @floatCast(group_scales_raw[row_in_tile * num_groups + g]);
+                const g_bytes = row_bytes[g * 64 .. (g + 1) * 64];
+                const out_g = out[g * 128 .. (g + 1) * 128];
+
+                for (0..64) |j| {
+                    const b = g_bytes[j];
+                    const q0: f32 = @floatFromInt(b & 0x0F);
+                    const q1: f32 = @floatFromInt((b >> 4) & 0x0F);
+                    out_g[2 * j] = (q0 - 8.0) * scale;
+                    out_g[2 * j + 1] = (q1 - 8.0) * scale;
+                }
+            }
+
+            if ((meta.custom_flags & FLAG_GROUP128_OUTLIERS) != 0) {
+                const outlier_w_raw: [*]const f16 = @ptrCast(@alignCast(payload[560..816].ptr));
+                const outlier_cols_raw: [*]const u16 = @ptrCast(@alignCast(payload[816..832].ptr));
+                inline for (0..8) |k| {
+                    const col_idx = outlier_cols_raw[k];
+                    if (col_idx < D) {
+                        out[col_idx] = @floatCast(outlier_w_raw[row_in_tile * 8 + k]);
+                    }
+                }
+            }
+            return;
+        }
+
+        const dims: *const TileDims = @ptrCast(@alignCast(payload[32..48].ptr));
+        const scale = dims.scale;
+        const bias = dims.bias;
+        const coded: [*]const u8 = @ptrCast(&cell.fingerprints);
+        const byte_offset = row_in_tile * (D / 2);
+        for (0..D / 2) |j| {
+            const b = coded[byte_offset + j];
+            const q0: f32 = @floatFromInt(b & 0x0F);
+            const q1: f32 = @floatFromInt((b >> 4) & 0x0F);
+            out[2 * j] = (q0 - 8.0) * scale + bias;
+            out[2 * j + 1] = (q1 - 8.0) * scale + bias;
+        }
+    }
+
     pub fn gemvLinear(
         self: *const CHPEEngine,
         tile_start: usize,
@@ -1063,6 +1160,30 @@ pub const CHPEEngine = struct {
             if (!accumulate) {
                 for (0..r_total) |r| {
                     y[r] = 0.01 * @as(f32, @floatFromInt(@as(i32, @intCast(r % 13)) - 6));
+                }
+            }
+            return;
+        }
+
+        if (!self.is_raw) {
+            // Polymorphic cell-based execution using self-describing TileDims
+            var row_base: usize = 0;
+            const available_tiles = @min(num_tiles, self.record_count - tile_start);
+            for (0..available_tiles) |t| {
+                if (row_base >= r_total) break;
+                const cell = self.getCellPointer(tile_start + t);
+                const dims: *const TileDims = @ptrCast(@alignCast(cell.semantic_payload[32..48].ptr));
+                if (dims.rows == 0) break;
+                gemvTilePolymorphic(cell, x, y, row_base, accumulate);
+                row_base += dims.rows;
+            }
+
+            if (bias_tile) |bt| {
+                if (bt < self.record_count) {
+                    self.unpackNorm(bt, self.bias_buf[0..r_total]);
+                    for (0..r_total) |r| {
+                        y[r] += self.bias_buf[r];
+                    }
                 }
             }
             return;
@@ -1152,35 +1273,13 @@ pub const CHPEEngine = struct {
                 }
             }
         } else {
-            const bytes_per_row = (D * self.quant_bits) / 8;
-            if (bytes_per_row > 0) {
-                const rows_per_tile = 16384 / bytes_per_row;
-                const rpt = if (rows_per_tile == 0) 1 else rows_per_tile;
-                const tile_idx = token_id / rpt;
-                const row_in_tile = token_id % rpt;
-                if (tile_idx < self.record_count) {
-                    const tile_ptr = self.getTileCodedPtr(tile_idx);
-                    if (self.quant_bits == 2) {
-                        const LUT: [4]f32 = .{ 0.0, 1.0, -2.0, -1.0 };
-                        const row_bytes = tile_ptr + row_in_tile * (D / 4);
-                        for (0..D / 4) |b| {
-                            const byte_val = row_bytes[b];
-                            out[4 * b + 0] = LUT[byte_val & 0x03] * 0.002;
-                            out[4 * b + 1] = LUT[(byte_val >> 2) & 0x03] * 0.002;
-                            out[4 * b + 2] = LUT[(byte_val >> 4) & 0x03] * 0.002;
-                            out[4 * b + 3] = LUT[(byte_val >> 6) & 0x03] * 0.002;
-                        }
-                        return;
-                    } else if (self.quant_bits == 4) {
-                        const row_bytes = tile_ptr + row_in_tile * (D / 2);
-                        for (0..D / 2) |b| {
-                            const byte_val = row_bytes[b];
-                            out[2 * b + 0] = @as(f32, @floatFromInt(@as(i8, @intCast(byte_val & 0x0F)) - 8)) * 0.001;
-                            out[2 * b + 1] = @as(f32, @floatFromInt(@as(i8, @intCast((byte_val >> 4) & 0x0F)) - 8)) * 0.001;
-                        }
-                        return;
-                    }
-                }
+            // Cell archive: 4-bit (16 rows) or 2-bit (32 rows)
+            const tile_idx = token_id / 16;
+            const row_in_tile = token_id % 16;
+            if (tile_idx < self.record_count) {
+                const cell = self.getCellPointer(tile_idx);
+                unpackEmbedRowCell(cell, row_in_tile, out);
+                return;
             }
         }
 
@@ -1217,8 +1316,36 @@ pub const CHPEEngine = struct {
             }
         }
 
-        // Tied embeddings (3B): stream through vocab tokens
-        const rows_per_tile = if (self.is_raw) (8192 / D) else (16384 / ((D * self.quant_bits) / 8));
+        if (!self.is_raw) {
+            // Tied embeddings (3B) in cell archive
+            var dummy_token_row: [8192]f32 = undefined;
+            const total_emb_tiles = @min(self.record_count, (V + 15) / 16);
+            for (0..total_emb_tiles) |t| {
+                const cell = self.getCellPointer(t);
+                for (0..16) |r| {
+                    const v = t * 16 + r;
+                    if (v >= V) break;
+                    unpackEmbedRowCell(cell, r, dummy_token_row[0..D]);
+                    var k: usize = 0;
+                    const Vec8 = @Vector(8, f32);
+                    var acc: Vec8 = @splat(0.0);
+                    while (k + 8 <= D) : (k += 8) {
+                        const a: Vec8 = self.norm_buf[k..][0..8].*;
+                        const b: Vec8 = dummy_token_row[k..][0..8].*;
+                        acc = @mulAdd(Vec8, a, b, acc);
+                    }
+                    var sum = @reduce(.Add, acc);
+                    while (k < D) : (k += 1) {
+                        sum += self.norm_buf[k] * dummy_token_row[k];
+                    }
+                    self.logits_buf[v] = sum;
+                }
+            }
+            return;
+        }
+
+        // Tied embeddings (3B) in raw archive
+        const rows_per_tile = 8192 / D;
         const rpt = if (rows_per_tile == 0) 1 else rows_per_tile;
         const total_emb_tiles = @min(self.record_count, (V + rpt - 1) / rpt);
 
@@ -1244,7 +1371,7 @@ pub const CHPEEngine = struct {
                     while (k < D) : (k += 1) {
                         sum += @as(f32, @floatCast(row[k])) * self.norm_buf[k];
                     }
-                } else if (self.is_raw) {
+                } else {
                     const tile_u16: [*]const u16 = @ptrCast(@alignCast(tile_ptr));
                     const row = tile_u16 + r * D;
                     var k: usize = 0;
@@ -1259,16 +1386,6 @@ pub const CHPEEngine = struct {
                     while (k < D) : (k += 1) {
                         const w: f32 = @bitCast(@as(u32, row[k]) << 16);
                         sum += w * self.norm_buf[k];
-                    }
-                } else if (self.quant_bits == 2) {
-                    const LUT: [4]f32 = .{ 0.0, 1.0, -2.0, -1.0 };
-                    const row = tile_ptr + r * (D / 4);
-                    for (0..D / 4) |b| {
-                        const byte_val = row[b];
-                        sum += (LUT[byte_val & 0x03] * self.norm_buf[4 * b + 0] +
-                            LUT[(byte_val >> 2) & 0x03] * self.norm_buf[4 * b + 1] +
-                            LUT[(byte_val >> 4) & 0x03] * self.norm_buf[4 * b + 2] +
-                            LUT[(byte_val >> 6) & 0x03] * self.norm_buf[4 * b + 3]) * 0.002;
                     }
                 }
                 self.logits_buf[v] = sum;
