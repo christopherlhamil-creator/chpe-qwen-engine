@@ -117,7 +117,6 @@ pub inline fn unpack1D(rec: *const geometry.Record, out: []f32) void {
 
 /// Unpacks a specific 2048-weight token embedding row from an embed_tokens cell tile.
 pub fn unpackEmbedRowCell(cell: *const geometry.Cell, row_in_tile: usize, out: []f32) void {
-    std.debug.assert(row_in_tile < 16);
     std.debug.assert(out.len == HIDDEN_DIM);
 
     const payload = &cell.semantic_payload;
@@ -140,7 +139,38 @@ pub fn unpackEmbedRowCell(cell: *const geometry.Cell, row_in_tile: usize, out: [
         }
         return;
     }
+    if (meta.quant_bits == 2) {
+        std.debug.assert(row_in_tile < 32);
+        const group_scales_raw: [*]const f16 = @ptrCast(@alignCast(payload[48..560].ptr));
+        const coded: [*]const u8 = @ptrCast(&cell.fingerprints);
+        const row_bytes = coded[row_in_tile * 512 .. (row_in_tile + 1) * 512];
+        const LUT: [4]f32 = .{ 0.0, 1.0, -2.0, -1.0 };
+
+        for (0..16) |g| {
+            const scale: f32 = @floatCast(group_scales_raw[row_in_tile * 16 + g]);
+            const g_bytes = row_bytes[g * 32 .. (g + 1) * 32];
+            const out_g = out[g * 128 .. (g + 1) * 128];
+
+            for (0..32) |j| {
+                const b = g_bytes[j];
+                out_g[4 * j + 0] = LUT[b & 0x03] * scale;
+                out_g[4 * j + 1] = LUT[(b >> 2) & 0x03] * scale;
+                out_g[4 * j + 2] = LUT[(b >> 4) & 0x03] * scale;
+                out_g[4 * j + 3] = LUT[(b >> 6) & 0x03] * scale;
+            }
+        }
+        if ((meta.custom_flags & weight_archive.FLAG_GROUP128_OUTLIERS) != 0) {
+            const outlier_w_raw: [*]const f16 = @ptrCast(@alignCast(payload[560..816].ptr));
+            const outlier_cols_raw: [*]const u16 = @ptrCast(@alignCast(payload[816..832].ptr));
+            inline for (0..8) |k| {
+                const col_idx = outlier_cols_raw[k];
+                out[col_idx] = @floatCast(outlier_w_raw[row_in_tile * 8 + k]);
+            }
+        }
+        return;
+    }
     if ((meta.custom_flags & weight_archive.FLAG_GROUP128_OUTLIERS) != 0 or meta.quant_bits == 4) {
+        std.debug.assert(row_in_tile < 16);
         const group_scales_raw: [*]const f16 = @ptrCast(@alignCast(payload[48..560].ptr));
         const coded: [*]const u8 = @ptrCast(&cell.fingerprints);
 
@@ -2280,6 +2310,11 @@ pub fn gemvTileQuadRowCellDirect(cell: *const geometry.Cell, act: *const Activat
     const payload = &cell.semantic_payload;
     const meta: *const weight_archive.TileMetadata = @ptrCast(@alignCast(payload.ptr));
 
+    if (meta.quant_bits == 2) {
+        gemvTileW2CellDirect(cell, act, y, row_base, accumulate);
+        return;
+    }
+
     if ((meta.custom_flags & weight_archive.FLAG_GROUP128_OUTLIERS) != 0 or meta.quant_bits == 4) {
         const group_scales_raw: [*]const f16 = @ptrCast(@alignCast(payload[48..560].ptr));
         const coded: [*]const u8 = @ptrCast(&cell.fingerprints);
@@ -2292,7 +2327,7 @@ pub fn gemvTileQuadRowCellDirect(cell: *const geometry.Cell, act: *const Activat
             const outlier_cols_raw: [*]const u16 = @ptrCast(@alignCast(payload[816..832].ptr));
             inline for (0..8) |k| {
                 const col_idx = outlier_cols_raw[k];
-                x_outlier[k] = act.raw[col_idx];
+                x_outlier[k] = if ((col_idx & 1) == 0) act.even[col_idx / 2] else act.odd[col_idx / 2];
             }
         }
 
@@ -2760,8 +2795,10 @@ pub fn gemvTileQuadRowGateUpFusedCellDirect(
         var g_x_outlier: @Vector(8, f32) = undefined;
         var u_x_outlier: @Vector(8, f32) = undefined;
         inline for (0..8) |k| {
-            g_x_outlier[k] = act.raw[g_outlier_cols[k]];
-            u_x_outlier[k] = act.raw[u_outlier_cols[k]];
+            const g_col = g_outlier_cols[k];
+            const u_col = u_outlier_cols[k];
+            g_x_outlier[k] = if ((g_col & 1) == 0) act.even[g_col / 2] else act.odd[g_col / 2];
+            u_x_outlier[k] = if ((u_col & 1) == 0) act.even[u_col / 2] else act.odd[u_col / 2];
         }
 
         const mask0f_16: @Vector(16, u8) = @splat(0x0F);
@@ -3154,6 +3191,10 @@ pub fn gemvTileQuadRowCellDirectWithMax(
 ) void {
     const payload = &cell.semantic_payload;
     const meta: *const weight_archive.TileMetadata = @ptrCast(@alignCast(payload.ptr));
+    if (meta.quant_bits == 2) {
+        gemvTileLMHeadW2WithMax(cell, act, y, row_base, w_max, w_argmax, w_finite);
+        return;
+    }
 
     if ((meta.custom_flags & weight_archive.FLAG_GROUP128_OUTLIERS) != 0 or meta.quant_bits == 4) {
         const group_scales_raw: [*]const f16 = @ptrCast(@alignCast(payload[48..560].ptr));
@@ -3167,7 +3208,7 @@ pub fn gemvTileQuadRowCellDirectWithMax(
             const outlier_cols_raw: [*]const u16 = @ptrCast(@alignCast(payload[816..832].ptr));
             inline for (0..8) |k| {
                 const col_idx = outlier_cols_raw[k];
-                x_outlier[k] = act.raw[col_idx];
+                x_outlier[k] = if ((col_idx & 1) == 0) act.even[col_idx / 2] else act.odd[col_idx / 2];
             }
         }
 
@@ -3675,13 +3716,15 @@ pub fn gemvTileDownW8(cell: *const geometry.Cell, act: *const Activation11008, y
 
         c += 128;
         if (c == INTERMEDIATE_DIM) {
-            y[r] += row_accum;
+            if (r < y.len) {
+                y[r] += row_accum;
+            }
             row_accum = 0.0;
             c = 0;
             r += 1;
         }
     }
-    if (row_accum != 0.0) {
+    if (row_accum != 0.0 and r < y.len) {
         y[r] += row_accum;
     }
 }
@@ -3711,6 +3754,193 @@ pub fn gemvTileLMHeadW8WithMax(
     }
 }
 
+pub fn gemvTileW2CellDirect(cell: *const geometry.Cell, act: *const Activation2048, y: []f32, row_base: usize, comptime accumulate: bool) void {
+    const payload = &cell.semantic_payload;
+    const meta: *const weight_archive.TileMetadata = @ptrCast(@alignCast(payload.ptr));
+    const group_scales_raw: [*]const f16 = @ptrCast(@alignCast(payload[48..560].ptr));
+    const coded: [*]const u8 = @ptrCast(&cell.fingerprints);
+    const has_outliers = (meta.custom_flags & weight_archive.FLAG_GROUP128_OUTLIERS) != 0;
+
+    var x_outlier: @Vector(8, f32) = @splat(0.0);
+    var outlier_w_raw: [*]const f16 = undefined;
+    if (has_outliers) {
+        outlier_w_raw = @ptrCast(@alignCast(payload[560..816].ptr));
+        const outlier_cols_raw: [*]const u16 = @ptrCast(@alignCast(payload[816..832].ptr));
+        inline for (0..8) |k| {
+            const col_idx = outlier_cols_raw[k];
+            x_outlier[k] = if ((col_idx & 1) == 0) act.even[col_idx / 2] else act.odd[col_idx / 2];
+        }
+    }
+
+    const LUT: [4]f32 = .{ 0.0, 1.0, -2.0, -1.0 };
+
+    for (0..16) |r| {
+        var row_sum: f32 = 0.0;
+        const row_bytes = coded[r * 512 .. (r + 1) * 512];
+        for (0..16) |g| {
+            const scale: f32 = @floatCast(group_scales_raw[r * 16 + g]);
+            const g_bytes = row_bytes[g * 32 .. (g + 1) * 32];
+            const x_slice = act.raw[g * 128 .. (g + 1) * 128];
+
+            var dot_v0: @Vector(8, f32) = @splat(0.0);
+            var dot_v1: @Vector(8, f32) = @splat(0.0);
+            var j: usize = 0;
+            while (j < 32) : (j += 4) {
+                const b0 = g_bytes[j + 0];
+                const b1 = g_bytes[j + 1];
+                const b2 = g_bytes[j + 2];
+                const b3 = g_bytes[j + 3];
+
+                const qv0: @Vector(8, f32) = .{
+                    LUT[b0 & 0x03],
+                    LUT[(b0 >> 2) & 0x03],
+                    LUT[(b0 >> 4) & 0x03],
+                    LUT[(b0 >> 6) & 0x03],
+                    LUT[b1 & 0x03],
+                    LUT[(b1 >> 2) & 0x03],
+                    LUT[(b1 >> 4) & 0x03],
+                    LUT[(b1 >> 6) & 0x03],
+                };
+                const qv1: @Vector(8, f32) = .{
+                    LUT[b2 & 0x03],
+                    LUT[(b2 >> 2) & 0x03],
+                    LUT[(b2 >> 4) & 0x03],
+                    LUT[(b2 >> 6) & 0x03],
+                    LUT[b3 & 0x03],
+                    LUT[(b3 >> 2) & 0x03],
+                    LUT[(b3 >> 4) & 0x03],
+                    LUT[(b3 >> 6) & 0x03],
+                };
+                const xv0: @Vector(8, f32) = x_slice[4 * j ..][0..8].*;
+                const xv1: @Vector(8, f32) = x_slice[4 * j + 8 ..][0..8].*;
+                dot_v0 += qv0 * xv0;
+                dot_v1 += qv1 * xv1;
+            }
+            row_sum += @reduce(.Add, dot_v0 + dot_v1) * scale;
+        }
+
+        if (has_outliers) {
+            var w_outlier: @Vector(8, f32) = undefined;
+            inline for (0..8) |k| {
+                w_outlier[k] = @floatCast(outlier_w_raw[r * 8 + k]);
+            }
+            row_sum += @reduce(.Add, w_outlier * x_outlier);
+        }
+
+        if (comptime accumulate) {
+            y[row_base + r] += row_sum;
+        } else {
+            y[row_base + r] = row_sum;
+        }
+    }
+}
+
+pub fn gemvTileLMHeadW2WithMax(
+    cell: *const geometry.Cell,
+    act: *const Activation2048,
+    logits: []f32,
+    base_row: usize,
+    max_val: *f32,
+    argmax: *u32,
+    finite: *bool,
+) void {
+    gemvTileW2CellDirect(cell, act, logits, base_row, false);
+    inline for (0..16) |offset| {
+        const idx: u32 = @intCast(base_row + offset);
+        if (idx < VOCAB_SIZE) {
+            const val = logits[idx];
+            if (!std.math.isFinite(val)) {
+                finite.* = false;
+            }
+            if (val > max_val.*) {
+                max_val.* = val;
+                argmax.* = idx;
+            }
+        }
+    }
+}
+
+pub fn gemvTileDownW2(cell: *const geometry.Cell, act: *const Activation11008, y: []f32, tile_idx: usize) void {
+    const payload = &cell.semantic_payload;
+    const group_scales_raw: [*]const f16 = @ptrCast(@alignCast(payload[48..560].ptr));
+    const num_outliers: usize = std.mem.readInt(u16, payload[560..562], .little);
+    const outlier_w_raw: [*]const f16 = @ptrCast(@alignCast(payload[562..690].ptr));
+    const outlier_offsets_raw: [*]const u16 = @ptrCast(@alignCast(payload[690..818].ptr));
+    const coded: [*]const u8 = @ptrCast(&cell.fingerprints);
+
+    const LUT: [4]f32 = .{ 0.0, 1.0, -2.0, -1.0 };
+
+    const global_k_start: usize = tile_idx * 32768;
+    var r: usize = global_k_start / INTERMEDIATE_DIM;
+    var c: usize = global_k_start % INTERMEDIATE_DIM;
+
+    var row_accum: f32 = 0.0;
+    for (0..256) |g| {
+        const scale: f32 = @floatCast(group_scales_raw[g]);
+        const g_bytes = coded[g * 32 .. (g + 1) * 32];
+        const x_slice = act.raw[c .. c + 128];
+
+        var dot_v0: @Vector(8, f32) = @splat(0.0);
+        var dot_v1: @Vector(8, f32) = @splat(0.0);
+        var j: usize = 0;
+        while (j < 32) : (j += 4) {
+            const b0 = g_bytes[j + 0];
+            const b1 = g_bytes[j + 1];
+            const b2 = g_bytes[j + 2];
+            const b3 = g_bytes[j + 3];
+
+            const qv0: @Vector(8, f32) = .{
+                LUT[b0 & 0x03],
+                LUT[(b0 >> 2) & 0x03],
+                LUT[(b0 >> 4) & 0x03],
+                LUT[(b0 >> 6) & 0x03],
+                LUT[b1 & 0x03],
+                LUT[(b1 >> 2) & 0x03],
+                LUT[(b1 >> 4) & 0x03],
+                LUT[(b1 >> 6) & 0x03],
+            };
+            const qv1: @Vector(8, f32) = .{
+                LUT[b2 & 0x03],
+                LUT[(b2 >> 2) & 0x03],
+                LUT[(b2 >> 4) & 0x03],
+                LUT[(b2 >> 6) & 0x03],
+                LUT[b3 & 0x03],
+                LUT[(b3 >> 2) & 0x03],
+                LUT[(b3 >> 4) & 0x03],
+                LUT[(b3 >> 6) & 0x03],
+            };
+            const xv0: @Vector(8, f32) = x_slice[4 * j ..][0..8].*;
+            const xv1: @Vector(8, f32) = x_slice[4 * j + 8 ..][0..8].*;
+            dot_v0 += qv0 * xv0;
+            dot_v1 += qv1 * xv1;
+        }
+        row_accum += @reduce(.Add, dot_v0 + dot_v1) * scale;
+        c += 128;
+        if (c == INTERMEDIATE_DIM) {
+            if (r < y.len) {
+                y[r] += row_accum;
+            }
+            row_accum = 0.0;
+            c = 0;
+            r += 1;
+        }
+    }
+    if (row_accum != 0.0 and r < y.len) {
+        y[r] += row_accum;
+    }
+
+    for (0..num_outliers) |i| {
+        const w_idx: usize = outlier_offsets_raw[i];
+        const glob_k = global_k_start + w_idx;
+        const r_out = glob_k / INTERMEDIATE_DIM;
+        const c_out = glob_k - r_out * INTERMEDIATE_DIM;
+        const w_val: f32 = @floatCast(outlier_w_raw[i]);
+        if (r_out < y.len) {
+            y[r_out] += w_val * act.raw[c_out];
+        }
+    }
+}
+
 /// Computes dot products of x (dim 2048) against all 16 rows in rec, accumulating into y[row_base..row_base+16].
 pub fn gemvTile(rec: *const geometry.Record, x: []const f32, y: []f32, row_base: usize) void {
     gemvTileOpt(rec, x, y, row_base, null);
@@ -3725,6 +3955,11 @@ pub fn gemvTileOpt(rec: *const geometry.Record, x: []const f32, y: []f32, row_ba
 pub fn gemvTileDownDeintCellOpt(cell: *const geometry.Cell, act: *const Activation11008, y: []f32, tile_idx: usize, comptime use_sdot: bool) void {
     const payload = &cell.semantic_payload;
     const meta: *const weight_archive.TileMetadata = @ptrCast(@alignCast(payload.ptr));
+
+    if (meta.quant_bits == 2) {
+        gemvTileDownW2(cell, act, y, tile_idx);
+        return;
+    }
 
     if ((meta.custom_flags & weight_archive.FLAG_GROUP128_OUTLIERS) != 0) {
         const group_scales_raw: [*]const f16 = @ptrCast(@alignCast(payload[48..560].ptr));
@@ -3886,14 +4121,16 @@ pub fn gemvTileDownDeintCellOpt(cell: *const geometry.Cell, act: *const Activati
             c += 128;
             group_in_row += 1;
             if (c == INTERMEDIATE_DIM) {
-                y[r] += row_accum;
+                if (r < y.len) {
+                    y[r] += row_accum;
+                }
                 row_accum = 0.0;
                 c = 0;
                 r += 1;
                 group_in_row = 0;
             }
         }
-        if (row_accum != 0.0) {
+        if (row_accum != 0.0 and r < y.len) {
             y[r] += row_accum;
         }
 
@@ -3903,7 +4140,9 @@ pub fn gemvTileDownDeintCellOpt(cell: *const geometry.Cell, act: *const Activati
             const r_out = glob_k / INTERMEDIATE_DIM;
             const c_out = glob_k - r_out * INTERMEDIATE_DIM;
             const w_val: f32 = @floatCast(outlier_w_raw[i]);
-            y[r_out] += w_val * act.raw[c_out];
+            if (r_out < y.len) {
+                y[r_out] += w_val * act.raw[c_out];
+            }
         }
         return;
     }
@@ -3948,7 +4187,9 @@ pub fn gemvTileDownDeintCellOpt(cell: *const geometry.Cell, act: *const Activati
 
         const dot_acc = @reduce(.Add, dot_vec);
         const sum_x_acc = @reduce(.Add, sum_x_vec);
-        y[r] += dot_acc * scale + sum_x_acc * bias;
+        if (r < y.len) {
+            y[r] += dot_acc * scale + sum_x_acc * bias;
+        }
 
         w_idx += span_len;
         c += span_len;
@@ -4105,14 +4346,16 @@ pub fn gemvTileDownDeintCell8Acc(cell: *const geometry.Cell, act: *const Activat
             c += 128;
             group_in_row += 1;
             if (c == INTERMEDIATE_DIM) {
-                y[r] += row_accum;
+                if (r < y.len) {
+                    y[r] += row_accum;
+                }
                 row_accum = 0.0;
                 c = 0;
                 r += 1;
                 group_in_row = 0;
             }
         }
-        if (row_accum != 0.0) {
+        if (row_accum != 0.0 and r < y.len) {
             y[r] += row_accum;
         }
 
@@ -4122,7 +4365,9 @@ pub fn gemvTileDownDeintCell8Acc(cell: *const geometry.Cell, act: *const Activat
             const r_out = glob_k / INTERMEDIATE_DIM;
             const c_out = glob_k - r_out * INTERMEDIATE_DIM;
             const w_val: f32 = @floatCast(outlier_w_raw[i]);
-            y[r_out] += w_val * act.raw[c_out];
+            if (r_out < y.len) {
+                y[r_out] += w_val * act.raw[c_out];
+            }
         }
         return;
     }
@@ -4178,7 +4423,9 @@ pub fn gemvTileDownDeintCell8Acc(cell: *const geometry.Cell, act: *const Activat
 
         const dot_total = @reduce(.Add, dot_vec);
         const sum_x_total = @reduce(.Add, sum_x_vec);
-        y[r] += dot_total * scale + sum_x_total * bias;
+        if (r < y.len) {
+            y[r] += dot_total * scale + sum_x_total * bias;
+        }
 
         w_idx += span_len;
         c += span_len;
@@ -5645,7 +5892,7 @@ pub fn decodeSequenceWithArchive(
 
     // Step 1: Initialize 36 layer KV caches
     for (0..NUM_LAYERS) |l| {
-        static_kv_caches[l] = attn.KvCache.init();
+        static_kv_caches[l].reset();
     }
 
     prof_qkv_ns = 0;
@@ -6198,6 +6445,117 @@ test "gemvTileLMHead8RowWithMax parity" {
     gemvTileLMHead8RowWithMax(&cell, &act, &logits, 0, false, &w_max, &w_argmax, &w_finite);
     try std.testing.expect(w_finite);
     try std.testing.expect(std.math.isFinite(w_max));
+}
+
+test "gemvTileW2CellDirect synthetic numerical parity" {
+    var cell: geometry.Cell = undefined;
+    @memset(std.mem.asBytes(&cell), 0);
+    const meta: *weight_archive.TileMetadata = @ptrCast(@alignCast(&cell.semantic_payload));
+    meta.quant_bits = 2;
+    meta.custom_flags = 0;
+
+    const group_scales_raw: [*]f16 = @ptrCast(@alignCast(cell.semantic_payload[48..560].ptr));
+    for (0..256) |i| {
+        group_scales_raw[i] = 1.0;
+    }
+
+    const coded: [*]u8 = @ptrCast(&cell.fingerprints);
+    coded[0] = 0x55;
+
+    var raw_x: [HIDDEN_DIM]f32 = @splat(1.0);
+    var act: Activation2048 = undefined;
+    Activation2048.initInto(&act, &raw_x);
+
+    var y: [16]f32 = @splat(0.0);
+    gemvTileW2CellDirect(&cell, &act, &y, 0, false);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), y[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), y[1], 1e-6);
+}
+
+test "gemvTileW2CellDirect with outliers" {
+    var cell: geometry.Cell = undefined;
+    @memset(std.mem.asBytes(&cell), 0);
+    const meta: *weight_archive.TileMetadata = @ptrCast(@alignCast(&cell.semantic_payload));
+    meta.quant_bits = 2;
+    meta.custom_flags = weight_archive.FLAG_GROUP128_OUTLIERS;
+
+    const group_scales_raw: [*]f16 = @ptrCast(@alignCast(cell.semantic_payload[48..560].ptr));
+    for (0..256) |i| {
+        group_scales_raw[i] = 1.0;
+    }
+
+    const outlier_w_raw: [*]f16 = @ptrCast(@alignCast(cell.semantic_payload[560..816].ptr));
+    const outlier_cols_raw: [*]u16 = @ptrCast(@alignCast(cell.semantic_payload[816..832].ptr));
+    outlier_cols_raw[0] = 10;
+    outlier_w_raw[0] = 5.0; // row 0 outlier 0 is weight 5.0 at col 10
+
+    var raw_x: [HIDDEN_DIM]f32 = @splat(0.0);
+    raw_x[10] = 2.0; // activation at col 10 is 2.0
+    var act: Activation2048 = undefined;
+    Activation2048.initInto(&act, &raw_x);
+
+    var y: [16]f32 = @splat(0.0);
+    gemvTileW2CellDirect(&cell, &act, &y, 0, false);
+
+    // Expected: 5.0 * 2.0 = 10.0
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), y[0], 1e-6);
+}
+
+test "gemvTileDownW2 synthetic numerical parity" {
+    var cell: geometry.Cell = undefined;
+    @memset(std.mem.asBytes(&cell), 0);
+    const meta: *weight_archive.TileMetadata = @ptrCast(@alignCast(&cell.semantic_payload));
+    meta.quant_bits = 2;
+    meta.custom_flags = 0;
+
+    const group_scales_raw: [*]f16 = @ptrCast(@alignCast(cell.semantic_payload[48..560].ptr));
+    for (0..256) |i| {
+        group_scales_raw[i] = 1.0;
+    }
+
+    const coded: [*]u8 = @ptrCast(&cell.fingerprints);
+    coded[0] = 0x55; // four +1.0 weights in group 0
+
+    var raw_x: [INTERMEDIATE_DIM]f32 = @splat(1.0);
+    var act: Activation11008 = undefined;
+    act.raw = &raw_x;
+
+    var y: [HIDDEN_DIM]f32 = @splat(0.0);
+    gemvTileDownW2(&cell, &act, &y, 0);
+
+    // Group 0 belongs to row 0. 4 * 1.0 = 4.0
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), y[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), y[1], 1e-6);
+}
+
+test "gemvTileDownW2 with outliers" {
+    var cell: geometry.Cell = undefined;
+    @memset(std.mem.asBytes(&cell), 0);
+    const meta: *weight_archive.TileMetadata = @ptrCast(@alignCast(&cell.semantic_payload));
+    meta.quant_bits = 2;
+    meta.custom_flags = weight_archive.FLAG_GROUP128_OUTLIERS;
+
+    const group_scales_raw: [*]f16 = @ptrCast(@alignCast(cell.semantic_payload[48..560].ptr));
+    for (0..256) |i| {
+        group_scales_raw[i] = 1.0;
+    }
+
+    std.mem.writeInt(u16, cell.semantic_payload[560..562], 1, .little);
+    const outlier_w_raw: [*]f16 = @ptrCast(@alignCast(cell.semantic_payload[562..690].ptr));
+    const outlier_offsets_raw: [*]u16 = @ptrCast(@alignCast(cell.semantic_payload[690..818].ptr));
+    outlier_w_raw[0] = 7.0;
+    outlier_offsets_raw[0] = 10;
+
+    var raw_x: [INTERMEDIATE_DIM]f32 = @splat(0.0);
+    raw_x[10] = 3.0;
+    var act: Activation11008 = undefined;
+    act.raw = &raw_x;
+
+    var y: [HIDDEN_DIM]f32 = @splat(0.0);
+    gemvTileDownW2(&cell, &act, &y, 0);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 21.0), y[0], 1e-6);
 }
 
 
