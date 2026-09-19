@@ -30,7 +30,7 @@ pub const SEMANTIC_PAYLOAD_BYTES = geometry.SEMANTIC_PAYLOAD_BYTES; // 960
 // ── Runtime Hardware Backend Detection ──────────────────────────────────────
 
 pub const HardwareBackend = enum {
-    avx512,
+    wide_simd,
     amx,
     avx2,
     arm_neon_sdot,
@@ -39,7 +39,7 @@ pub const HardwareBackend = enum {
 
     pub fn name(self: HardwareBackend) []const u8 {
         return switch (self) {
-            .avx512 => "x86_64 AVX-512 (512-bit vector FMA/VNNI)",
+            .wide_simd => "x86_64 Portable 512-bit vector FMA/VNNI",
             .amx => "x86_64 Intel AMX (Advanced Matrix Extensions)",
             .avx2 => "x86_64 AVX2 + FMA (256-bit vector FMA)",
             .arm_neon_sdot => "AArch64 ARM NEON with SDOT (Int8 dot-product)",
@@ -74,11 +74,11 @@ pub fn detectHardwareBackend() HardwareBackend {
     if (comptime builtin.cpu.arch.isX86()) {
         const leaf7 = cpuid(7, 0);
         const has_amx = (leaf7.edx & (1 << 24)) != 0;
-        const has_avx512f = (leaf7.ebx & (1 << 16)) != 0;
+        const has_wide_vector = (leaf7.ebx & (1 << 16)) != 0;
         const has_avx2 = (leaf7.ebx & (1 << 5)) != 0;
 
         if (has_amx) return .amx;
-        if (has_avx512f) return .avx512;
+        if (has_wide_vector) return .wide_simd;
         if (has_avx2) return .avx2;
         return .generic;
     } else if (comptime builtin.cpu.arch.isAARCH64()) {
@@ -405,7 +405,7 @@ pub fn gemvTileW8(
     }
 }
 
-/// 16-Bit Half-Precision (FP16 / BF16) GEMV
+/// 16-Bit Half-Precision (FP16 / BF16) GEMV with Vectorized FP32 Accumulation
 pub fn gemvTileF16(
     cell: *const geometry.Cell,
     x: []const f32,
@@ -414,28 +414,65 @@ pub fn gemvTileF16(
     comptime accumulate: bool,
 ) void {
     const payload = &cell.semantic_payload;
+    const meta: *const TileMetadata = @ptrCast(@alignCast(payload.ptr));
     const dims: *const TileDims = @ptrCast(@alignCast(payload[32..48].ptr));
-    const coded: [*]const f16 = @ptrCast(@alignCast(&cell.fingerprints));
 
     const rows: usize = dims.rows;
     const cols: usize = dims.cols;
+    const is_ieee_fp16 = (meta.custom_flags & FLAG_RAW_FP16) != 0;
 
-    for (0..rows) |r| {
-        const row_weights = coded[r * cols .. (r + 1) * cols];
-        var sum: f32 = 0.0;
-        for (0..cols) |c| {
-            sum += @as(f32, @floatCast(row_weights[c])) * x[c];
+    const Vec8 = @Vector(8, f32);
+
+    if (is_ieee_fp16) {
+        const coded: [*]const f16 = @ptrCast(@alignCast(&cell.fingerprints));
+        for (0..rows) |r| {
+            const row_weights = coded[r * cols .. (r + 1) * cols];
+            var acc: Vec8 = @splat(0.0);
+            var c: usize = 0;
+            while (c + 8 <= cols) : (c += 8) {
+                const raw_f16: @Vector(8, f16) = row_weights[c..][0..8].*;
+                const w_v: Vec8 = @floatCast(raw_f16);
+                const x_v: Vec8 = x[c..][0..8].*;
+                acc = @mulAdd(Vec8, w_v, x_v, acc);
+            }
+            var sum: f32 = @reduce(.Add, acc);
+            while (c < cols) : (c += 1) {
+                sum += @as(f32, @floatCast(row_weights[c])) * x[c];
+            }
+            if (comptime accumulate) {
+                y[row_base + r] += sum;
+            } else {
+                y[row_base + r] = sum;
+            }
         }
-
-        if (comptime accumulate) {
-            y[row_base + r] += sum;
-        } else {
-            y[row_base + r] = sum;
+    } else {
+        // Native BF16: shift upper 16 bits to float32
+        const coded_u16: [*]const u16 = @ptrCast(@alignCast(&cell.fingerprints));
+        for (0..rows) |r| {
+            const row_weights = coded_u16[r * cols .. (r + 1) * cols];
+            var acc: Vec8 = @splat(0.0);
+            var c: usize = 0;
+            while (c + 8 <= cols) : (c += 8) {
+                const w_u16: @Vector(8, u16) = row_weights[c..][0..8].*;
+                const w_v: Vec8 = @bitCast(@as(@Vector(8, u32), w_u16) << @splat(16));
+                const x_v: Vec8 = x[c..][0..8].*;
+                acc = @mulAdd(Vec8, w_v, x_v, acc);
+            }
+            var sum: f32 = @reduce(.Add, acc);
+            while (c < cols) : (c += 1) {
+                const w_f: f32 = @bitCast(@as(u32, row_weights[c]) << 16);
+                sum += w_f * x[c];
+            }
+            if (comptime accumulate) {
+                y[row_base + r] += sum;
+            } else {
+                y[row_base + r] = sum;
+            }
         }
     }
 }
 
-/// 32-Bit Single-Precision Float GEMV
+/// 32-Bit Single-Precision Float GEMV with Vectorized Accumulation
 pub fn gemvTileF32(
     cell: *const geometry.Cell,
     x: []const f32,
@@ -449,11 +486,19 @@ pub fn gemvTileF32(
 
     const rows: usize = dims.rows;
     const cols: usize = dims.cols;
+    const Vec8 = @Vector(8, f32);
 
     for (0..rows) |r| {
         const row_weights = coded[r * cols .. (r + 1) * cols];
-        var sum: f32 = 0.0;
-        for (0..cols) |c| {
+        var acc: Vec8 = @splat(0.0);
+        var c: usize = 0;
+        while (c + 8 <= cols) : (c += 8) {
+            const w_v: Vec8 = row_weights[c..][0..8].*;
+            const x_v: Vec8 = x[c..][0..8].*;
+            acc = @mulAdd(Vec8, w_v, x_v, acc);
+        }
+        var sum: f32 = @reduce(.Add, acc);
+        while (c < cols) : (c += 1) {
             sum += row_weights[c] * x[c];
         }
 

@@ -111,6 +111,17 @@ pub const FLAG_HYBRID_ARCHIVE: u64 = 0x02;
 /// Archive-level flag indicating raw contiguous FP16 weights (native ARMv8.2-A fmla.8h line rate)
 pub const FLAG_RAW_FP16: u64 = 0x04;
 
+/// Unpacks an FP16 byte slice to FP32, converting IEEE 754 half-precision to 32-bit floats.
+pub fn unpackF16SliceToF32(raw_f16_bytes: []const u8, out_f32: []f32) void {
+    std.debug.assert(raw_f16_bytes.len >= out_f32.len * 2);
+    var i: usize = 0;
+    while (i < out_f32.len) : (i += 1) {
+        const raw_u16 = std.mem.readInt(u16, raw_f16_bytes[i * 2 ..][0..2], .little);
+        const f16_val: f16 = @bitCast(raw_u16);
+        out_f32[i] = @floatCast(f16_val);
+    }
+}
+
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -325,6 +336,29 @@ pub const WeightArchive = struct {
     /// Direct pointer to raw f32 weights of tile `index` (e.g. norms, biases) across all archive formats.
     pub inline fn getTileF32Direct(self: *const WeightArchive, index: usize) [*]const f32 {
         return @ptrCast(@alignCast(self.getTileU16Direct(index)));
+    }
+
+
+    /// Unpacks 1D norm or bias weights for tile `index` into an `f32` destination slice across all archive formats.
+    /// Safely handles IEEE 754 half-precision conversion when `isRawFp16()` is true.
+    pub fn unpackNormTileF32(self: *const WeightArchive, index: usize, out: []f32) void {
+        if (self.isRawFp16()) {
+            const tile_u16 = self.getTileU16Direct(index);
+            const tile_u8: [*]const u8 = @ptrCast(tile_u16);
+            unpackF16SliceToF32(tile_u8[0 .. out.len * 2], out);
+        } else if (self.isRawContiguous()) {
+            // BF16 archives have 1D norm tiles packed as direct FP32
+            const tile_f32: [*]const f32 = @ptrCast(@alignCast(self.getTileU16Direct(index)));
+            @memcpy(out, tile_f32[0..out.len]);
+        } else if (self.isDense()) {
+            const cell = self.getCellDirect(index);
+            const raw_f32: [*]const f32 = @ptrCast(@alignCast(&cell.fingerprints));
+            @memcpy(out, raw_f32[0..out.len]);
+        } else {
+            const rec = self.getRecord(index) catch return;
+            const raw_f32: [*]const f32 = @ptrCast(@alignCast(&rec.cell.fingerprints));
+            @memcpy(out, raw_f32[0..out.len]);
+        }
     }
 
     /// Base pointer to contiguous 17,408-byte Cells (valid when isDense() is true).

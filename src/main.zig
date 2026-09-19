@@ -1,20 +1,22 @@
-//! Executable CLI runner and benchmark suite for Qwen2.5-3B .chpe Forward Decode.
+//! Unified Polymorphic CHPE Forward Decode & Benchmark Runner
 //!
-//! Subsystem: tot_hybrid/src/main_qwen3b_fwd.zig
-//! Blueprint: docs/BLUEPRINT-20260914-QWEN3B-CHPE-PIPELINE.md
+//! Subsystem: tot_hybrid/src/main_chpe_fwd.zig
+//! Blueprint: docs/superpowers/specs/2026-09-19-unified-chpe-engine-and-physical-gauntlet-design.md
 
 const std = @import("std");
-const engine = @import("qwen3b_engine.zig");
+const chpe = @import("chpe_engine.zig");
 const weight_archive = @import("weight_archive.zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
 
-    var archive_path: [:0]const u8 = "models/warc/Qwen2.5-3B-Instruct.bf16.chpe";
+    var archive_path: [:0]const u8 = "models/warc/Qwen2.5-3B-Instruct.bf16.raw.chpe";
+    var tokens_file_path: ?[:0]const u8 = null;
+    var out_logits_path: ?[:0]const u8 = null;
+    var arch_override: ?[:0]const u8 = null;
     var bench_iters: usize = 1;
-    var run_seq: bool = false;
-    var custom_tokens: ?[]u32 = null;
+    var max_seq_len: usize = 2048;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -26,86 +28,54 @@ pub fn main(init: std.process.Init) !void {
                 @memcpy(s, args[i]);
                 archive_path = s;
             }
-        } else if (std.mem.eql(u8, arg, "--to-dense")) {
+        } else if (std.mem.eql(u8, arg, "--tokens-file")) {
             if (i + 1 < args.len) {
                 i += 1;
-                const dst_path = try allocator.allocSentinel(u8, args[i].len, 0);
-                @memcpy(dst_path, args[i]);
-                std.debug.print("=== [CHPE DENSE ARCHIVE CONVERTER] ===\n", .{});
-                std.debug.print("Source Archive : {s}\n", .{archive_path});
-                std.debug.print("Target Dense   : {s}\n", .{dst_path});
-                std.debug.print("Stripping 3,072B PreFetchLabelArea sector padding...\n", .{});
-                try weight_archive.convertToDensePosix(archive_path, dst_path);
-                std.debug.print("Success: Dense 17,408B-stride archive written. Zero DRAM bus padding.\n", .{});
-                return;
+                const s = try allocator.allocSentinel(u8, args[i].len, 0);
+                @memcpy(s, args[i]);
+                tokens_file_path = s;
             }
-        } else if (std.mem.eql(u8, arg, "--to-raw")) {
+        } else if (std.mem.eql(u8, arg, "--out-logits")) {
             if (i + 1 < args.len) {
                 i += 1;
-                const dst_path = try allocator.allocSentinel(u8, args[i].len, 0);
-                @memcpy(dst_path, args[i]);
-                std.debug.print("=== [CHPE RAW CONTIGUOUS ARCHIVE CONVERTER] ===\n", .{});
-                std.debug.print("Source Archive : {s}\n", .{archive_path});
-                std.debug.print("Target Raw     : {s}\n", .{dst_path});
-                std.debug.print("Stripping ALL 4,096B sector + cell padding (1.54 GB dead bandwidth)...\n", .{});
-                try weight_archive.convertToRawContiguousPosix(archive_path, dst_path);
-                std.debug.print("Success: Raw contiguous 16,384B-stride archive written (6.172 GB). Zero DRAM bus padding.\n", .{});
-                return;
+                const s = try allocator.allocSentinel(u8, args[i].len, 0);
+                @memcpy(s, args[i]);
+                out_logits_path = s;
             }
-        } else if (std.mem.eql(u8, arg, "--to-raw-fp16")) {
+        } else if (std.mem.eql(u8, arg, "--arch")) {
             if (i + 1 < args.len) {
                 i += 1;
-                const dst_path = try allocator.allocSentinel(u8, args[i].len, 0);
-                @memcpy(dst_path, args[i]);
-                std.debug.print("=== [CHPE RAW CONTIGUOUS FP16 ARCHIVE CONVERTER] ===\n", .{});
-                std.debug.print("Source Archive : {s}\n", .{archive_path});
-                std.debug.print("Target Raw FP16: {s}\n", .{dst_path});
-                std.debug.print("Converting BF16 -> IEEE 754 FP16 (ARMv8.2-A fmla.8h line rate)...\n", .{});
-                try weight_archive.convertToRawFp16ContiguousPosix(archive_path, dst_path);
-                std.debug.print("Success: Raw contiguous FP16 archive written (6.174 GB). Line-rate 8-lane SIMD.\n", .{});
-                return;
+                const s = try allocator.allocSentinel(u8, args[i].len, 0);
+                @memcpy(s, args[i]);
+                arch_override = s;
             }
         } else if (std.mem.eql(u8, arg, "--bench")) {
             if (i + 1 < args.len) {
                 i += 1;
                 bench_iters = std.fmt.parseInt(usize, args[i], 10) catch 1;
             }
-        } else if (std.mem.eql(u8, arg, "--seq")) {
-            run_seq = true;
-        } else if (std.mem.eql(u8, arg, "--tokens-file")) {
+        } else if (std.mem.eql(u8, arg, "--max-seq-len")) {
             if (i + 1 < args.len) {
                 i += 1;
-                const fpath = try allocator.allocSentinel(u8, args[i].len, 0);
-                @memcpy(fpath, args[i]);
-                const fd_val = std.os.linux.open(fpath, .{ .ACCMODE = .RDONLY }, 0);
-                if (std.os.linux.errno(fd_val) == .SUCCESS) {
-                    const fd: std.posix.fd_t = @intCast(fd_val);
-                    defer _ = std.os.linux.close(fd);
-                    var st: std.os.linux.Statx = undefined;
-                    if (std.os.linux.statx(fd, "", std.os.linux.AT.EMPTY_PATH, std.os.linux.STATX.BASIC_STATS, &st) == 0) {
-                        const fsize: usize = @intCast(st.size);
-                        const num_tokens = fsize / @sizeOf(u32);
-                        const tok_buf = try allocator.alloc(u32, num_tokens);
-                        _ = std.os.linux.read(fd, std.mem.sliceAsBytes(tok_buf).ptr, fsize);
-                        custom_tokens = tok_buf;
-                    }
-                }
+                max_seq_len = std.fmt.parseInt(usize, args[i], 10) catch 2048;
             }
-        } else if (std.mem.eql(u8, arg, "--tokens")) {
-            if (i + 1 < args.len) {
-                i += 1;
-                const tok_buf = try allocator.alloc(u32, 2048);
-                var count: usize = 0;
-                var it = std.mem.splitScalar(u8, args[i], ',');
-                while (it.next()) |chunk| {
-                    const trimmed = std.mem.trim(u8, chunk, " \t\r\n");
-                    if (trimmed.len > 0 and count < 2048) {
-                        tok_buf[count] = try std.fmt.parseInt(u32, trimmed, 10);
-                        count += 1;
-                    }
-                }
-                custom_tokens = tok_buf[0..count];
-            }
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            std.debug.print(
+                \\Unified Polymorphic CHPE Forward Engine
+                \\
+                \\Usage: chpe_fwd [OPTIONS]
+                \\
+                \\Options:
+                \\  --archive <path>       Path to .chpe weight archive
+                \\  --tokens-file <path>   Binary little-endian u32 tokens file
+                \\  --out-logits <path>    Destination binary file for output float logits
+                \\  --arch <name>          Model architecture (qwen2_5_3b | qwen3_5_9b | qwen2_5_72b)
+                \\  --bench <iters>        Benchmark iterations (default: 1)
+                \\  --max-seq-len <len>    Maximum sequence length (default: 2048)
+                \\  -h, --help             Display this help message
+                \\
+            , .{});
+            return;
         } else if (!std.mem.startsWith(u8, arg, "--")) {
             const s = try allocator.allocSentinel(u8, arg.len, 0);
             @memcpy(s, arg);
@@ -113,162 +83,165 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    std.debug.print("=== [QWEN3B CHPE BENCHMARK RUNNER] ===\n", .{});
-    std.debug.print("Model Archive : {s}\n", .{archive_path});
-    std.debug.print("Benchmark Runs: {}\n", .{bench_iters});
-    if (custom_tokens) |toks| {
-        std.debug.print("Custom Prompt : {} tokens\n", .{toks.len});
+    // Determine Model Architecture
+    var arch: chpe.ModelArch = chpe.ModelArch.Qwen2_5_3B;
+    if (arch_override) |ao| {
+        if (std.mem.indexOf(u8, ao, "9b") != null or std.mem.indexOf(u8, ao, "9B") != null) {
+            arch = chpe.ModelArch.Qwen3_5_9B;
+        } else if (std.mem.indexOf(u8, ao, "72b") != null or std.mem.indexOf(u8, ao, "72B") != null) {
+            arch = chpe.ModelArch.Qwen2_5_72B;
+        } else {
+            arch = chpe.ModelArch.Qwen2_5_3B;
+        }
+    } else {
+        if (std.mem.indexOf(u8, archive_path, "9B") != null or std.mem.indexOf(u8, archive_path, "9b") != null or std.mem.indexOf(u8, archive_path, "qwen35") != null) {
+            arch = chpe.ModelArch.Qwen3_5_9B;
+        } else if (std.mem.indexOf(u8, archive_path, "72B") != null or std.mem.indexOf(u8, archive_path, "72b") != null) {
+            arch = chpe.ModelArch.Qwen2_5_72B;
+        } else {
+            arch = chpe.ModelArch.Qwen2_5_3B;
+        }
     }
+
+    std.debug.print("=== [UNIFIED POLYMORPHIC CHPE FORWARD ENGINE] ===\n", .{});
+    std.debug.print("Model Arch     : {s} ({d} layers, D={d}, intermediate={d}, vocab={d})\n", .{
+        arch.name,
+        arch.num_layers,
+        arch.hidden_dim,
+        arch.intermediate_dim,
+        arch.vocab_size,
+    });
+    std.debug.print("Archive Path   : {s}\n", .{archive_path});
+
+    // Open Archive POSIX mmap
+    var archive = weight_archive.WeightArchive.openPosix(archive_path) catch |err| {
+        std.debug.print("ERROR: Failed to open weight archive '{s}': {s}\n", .{ archive_path, @errorName(err) });
+        return err;
+    };
+    defer archive.close();
+
+    std.debug.print("Archive Size   : {d} bytes ({d:.2} GB, {d} tiles)\n", .{
+        archive.file_size,
+        @as(f64, @floatFromInt(archive.file_size)) / (1024.0 * 1024.0 * 1024.0),
+        archive.recordCount(),
+    });
+
+    // Load custom tokens if provided
+    var prompt_tokens: []u32 = undefined;
+    var default_token = [_]u32{151644}; // <|im_start|> default
+    if (tokens_file_path) |tfp| {
+        const fd_val = std.os.linux.open(tfp, .{ .ACCMODE = .RDONLY }, 0);
+        if (std.os.linux.errno(fd_val) != .SUCCESS) {
+            std.debug.print("ERROR: Failed to open tokens file '{s}'\n", .{tfp});
+            return error.FileNotFound;
+        }
+        const fd: std.posix.fd_t = @intCast(fd_val);
+        defer _ = std.os.linux.close(fd);
+
+        var st: std.os.linux.Statx = undefined;
+        if (std.os.linux.statx(fd, "", std.os.linux.AT.EMPTY_PATH, std.os.linux.STATX.BASIC_STATS, &st) != 0) {
+            return error.StatFailed;
+        }
+        const fsize: usize = @intCast(st.size);
+        const num_tokens = fsize / @sizeOf(u32);
+        if (num_tokens == 0) return error.EmptyTokensFile;
+
+        prompt_tokens = try allocator.alloc(u32, num_tokens);
+        _ = std.os.linux.read(fd, std.mem.sliceAsBytes(prompt_tokens).ptr, fsize);
+        std.debug.print("Prompt Tokens  : Loaded {d} tokens from '{s}'\n", .{ prompt_tokens.len, tfp });
+    } else {
+        prompt_tokens = &default_token;
+        std.debug.print("Prompt Tokens  : Default single token [{d}]\n", .{default_token[0]});
+    }
+
+    // Initialize Polymorphic Engine
+    var engine = try chpe.CHPEEngine.init(allocator, archive.bytes, arch, max_seq_len);
+    defer engine.deinit();
+
+    std.debug.print("Hardware Core  : {s}\n", .{engine.hw_backend.name()});
+    std.debug.print("Execution Loop : Running forward pass over {d} prompt tokens...\n", .{prompt_tokens.len});
 
     var min_ms: f64 = std.math.inf(f64);
     var max_ms: f64 = 0.0;
     var sum_ms: f64 = 0.0;
-    var last_res: engine.ForwardResult = undefined;
-
-    const default_tok0 = [_]u32{0};
-    const active_prompt = if (custom_tokens) |toks| toks else &default_tok0;
-
-    var archive = try weight_archive.WeightArchive.openPosix(archive_path);
-    defer archive.close();
-
-    if (bench_iters > 1) {
-        std.debug.print("Warming up archive and cache across all 36 transformer layers...\n", .{});
-        _ = engine.decodeSequenceWithArchive(&archive, active_prompt, .generative_f32) catch {};
-    }
+    var last_result: chpe.ForwardResult = undefined;
 
     for (0..bench_iters) |iter| {
-        std.debug.print("Executing Run {}/{} across all 36 transformer layers (prompt_len={})...\n", .{ iter + 1, bench_iters, active_prompt.len });
-        const res = engine.decodeSequenceWithArchive(&archive, active_prompt, .generative_f32) catch |err| {
-            std.debug.print("ERROR: Decode failed with error: {s}\n", .{@errorName(err)});
-            return err;
-        };
-        last_res = res;
-        const cur_ms = @as(f64, @floatFromInt(res.elapsed_ns)) / 1_000_000.0;
+        const t_start = chpe.nowNs();
+        for (prompt_tokens, 0..) |tok, pos| {
+            last_result = engine.forwardDecode(tok, pos);
+        }
+        const t_elapsed = chpe.nowNs() - t_start;
+        const cur_ms = @as(f64, @floatFromInt(t_elapsed)) / 1_000_000.0;
+
         if (cur_ms < min_ms) min_ms = cur_ms;
         if (cur_ms > max_ms) max_ms = cur_ms;
         sum_ms += cur_ms;
-        std.debug.print("  -> Run {} latency: {d:.2} ms ({d:.3} s)\n", .{ iter + 1, cur_ms, cur_ms / 1000.0 });
-    }
 
-    const avg_ms = sum_ms / @as(f64, @floatFromInt(bench_iters));
-    const tokens_per_sec = 1000.0 / avg_ms;
-
-    std.debug.print("\n=== [MEASURED BENCHMARK SUMMARY] ===\n", .{});
-    std.debug.print("Argmax Decoded Token ID : {}\n", .{last_res.argmax_token});
-    std.debug.print("Maximum Vocab Logit     : {d:.6}\n", .{last_res.max_logit});
-    std.debug.print("Token 0 Logit           : {d:.6}\n", .{last_res.token0_logit});
-    std.debug.print("Final Hidden Vector Norm: {d:.6}\n", .{last_res.hidden_norm});
-    std.debug.print("Min Decode Time         : {d:.2} ms\n", .{min_ms});
-    std.debug.print("Mean Decode Time        : {d:.2} ms\n", .{avg_ms});
-    std.debug.print("Max Decode Time         : {d:.2} ms\n", .{max_ms});
-    std.debug.print("Decode Throughput       : {d:.3} tokens/sec\n", .{tokens_per_sec});
-    std.debug.print("Layers Executed         : 36\n", .{});
-    std.debug.print("Status                  : {s}\n", .{if (last_res.all_finite) "SUCCESS (All logits finite)" else "FAIL (Non-finite logit detected)"});
-
-    std.debug.print("\n--- [MICROARCHITECTURAL LATENCY BREAKDOWN (Last Run)] ---\n", .{});
-    const qkv_ms = @as(f64, @floatFromInt(engine.prof_qkv_ns)) / 1_000_000.0;
-    const attn_ms = @as(f64, @floatFromInt(engine.prof_attn_ns)) / 1_000_000.0;
-    const oproj_ms = @as(f64, @floatFromInt(engine.prof_oproj_ns)) / 1_000_000.0;
-    const norm_ms = @as(f64, @floatFromInt(engine.prof_norm_ns)) / 1_000_000.0;
-    const gateup_ms = @as(f64, @floatFromInt(engine.prof_gateup_ns)) / 1_000_000.0;
-    const down_ms = @as(f64, @floatFromInt(engine.prof_down_ns)) / 1_000_000.0;
-    const head_ms = @as(f64, @floatFromInt(engine.prof_head_ns)) / 1_000_000.0;
-    const total_prof_ms = qkv_ms + attn_ms + oproj_ms + norm_ms + gateup_ms + down_ms + head_ms;
-    std.debug.print("  QKV Proj (36 layers)    : {d:6.2} ms ({d:4.1}%)\n", .{ qkv_ms, qkv_ms / total_prof_ms * 100.0 });
-    std.debug.print("  Attn GQA (36 layers)    : {d:6.2} ms ({d:4.1}%)\n", .{ attn_ms, attn_ms / total_prof_ms * 100.0 });
-    std.debug.print("  O Proj   (36 layers)    : {d:6.2} ms ({d:4.1}%)\n", .{ oproj_ms, oproj_ms / total_prof_ms * 100.0 });
-    std.debug.print("  RMSNorm  (72 layers)    : {d:6.2} ms ({d:4.1}%)\n", .{ norm_ms, norm_ms / total_prof_ms * 100.0 });
-    std.debug.print("  Gate/Up  (36 layers)    : {d:6.2} ms ({d:4.1}%)\n", .{ gateup_ms, gateup_ms / total_prof_ms * 100.0 });
-    std.debug.print("  Down     (36 layers)    : {d:6.2} ms ({d:4.1}%)\n", .{ down_ms, down_ms / total_prof_ms * 100.0 });
-    std.debug.print("  LM Head  (151k vocab)   : {d:6.2} ms ({d:4.1}%)\n", .{ head_ms, head_ms / total_prof_ms * 100.0 });
-    std.debug.print("  Total Profiled Core Time: {d:6.2} ms\n", .{total_prof_ms});
-
-    // Dump all token-0 logits to run/qwen3b_engine_token0_logits.bin and run/qwen3b_engine_logits.bin
-    const logits_token0_path: [*:0]const u8 = "run/qwen3b_engine_token0_logits.bin";
-    const bin0_fd = std.os.linux.open(logits_token0_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
-    if (std.os.linux.errno(bin0_fd) == .SUCCESS) {
-        const fd: std.posix.fd_t = @intCast(bin0_fd);
-        defer _ = std.os.linux.close(fd);
-        const bytes_slice: []const u8 = std.mem.sliceAsBytes(last_res.logits);
-        _ = std.os.linux.write(fd, bytes_slice.ptr, bytes_slice.len);
-        std.debug.print("Token-0 Logits ({d} floats) dumped to {s}\n", .{ last_res.logits.len, logits_token0_path });
-    }
-    const logits_legacy_path: [*:0]const u8 = "run/qwen3b_engine_logits.bin";
-    const bin_leg_fd = std.os.linux.open(logits_legacy_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
-    if (std.os.linux.errno(bin_leg_fd) == .SUCCESS) {
-        const fd: std.posix.fd_t = @intCast(bin_leg_fd);
-        defer _ = std.os.linux.close(fd);
-        const bytes_slice: []const u8 = std.mem.sliceAsBytes(last_res.logits);
-        _ = std.os.linux.write(fd, bytes_slice.ptr, bytes_slice.len);
-    }
-
-    if (run_seq) {
-        std.debug.print("\n=== [MULTI-TOKEN SEQUENCE VALIDATION (seq_len=2)] ===\n", .{});
-        const prompt_tokens = [_]u32{ 151643, 0 };
-        const seq_res = engine.decodeSequenceWithArchive(&archive, &prompt_tokens, .generative_f32) catch |err| {
-            std.debug.print("ERROR: Multi-token sequence decode failed: {s}\n", .{@errorName(err)});
-            return err;
-        };
-        const seq_ms = @as(f64, @floatFromInt(seq_res.elapsed_ns)) / 1_000_000.0;
-        std.debug.print("Sequence Argmax Token ID: {}\n", .{seq_res.argmax_token});
-        std.debug.print("Sequence Max Logit      : {d:.6}\n", .{seq_res.max_logit});
-        std.debug.print("Sequence Elapsed Time   : {d:.2} ms\n", .{seq_ms});
-        std.debug.print("Sequence Status         : {s}\n", .{if (seq_res.all_finite) "PASS (All logits finite)" else "FAIL"});
-
-        // Dump sequence logits to run/qwen3b_engine_seq2_logits.bin
-        const logits_seq2_path: [*:0]const u8 = "run/qwen3b_engine_seq2_logits.bin";
-        const bin_seq_fd = std.os.linux.open(logits_seq2_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
-        if (std.os.linux.errno(bin_seq_fd) == .SUCCESS) {
-            const fd: std.posix.fd_t = @intCast(bin_seq_fd);
-            defer _ = std.os.linux.close(fd);
-            const bytes_slice: []const u8 = std.mem.sliceAsBytes(seq_res.logits);
-            _ = std.os.linux.write(fd, bytes_slice.ptr, bytes_slice.len);
-            std.debug.print("Sequence Logits ({d} floats) dumped to {s}\n", .{ seq_res.logits.len, logits_seq2_path });
+        if (bench_iters > 1) {
+            std.debug.print("  [Iter {d}/{d}] Latency: {d:.2} ms\n", .{ iter + 1, bench_iters, cur_ms });
         }
     }
 
-    // Write spoke outbox telemetry via POSIX open
-    const out_path: [*:0]const u8 = "run/spoke_outbox/metal.qwen3b_fwd.result.json";
-    const fd_val = std.os.linux.open(out_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
-    if (std.os.linux.errno(fd_val) == .SUCCESS) {
-        const fd: std.posix.fd_t = @intCast(fd_val);
-        defer _ = std.os.linux.close(fd);
+    const mean_ms = sum_ms / @as(f64, @floatFromInt(bench_iters));
+    const throughput = (@as(f64, @floatFromInt(prompt_tokens.len)) / (mean_ms / 1000.0));
 
-        var json_buf: [2048]u8 = undefined;
-        const json_str = try std.fmt.bufPrint(&json_buf,
+    std.debug.print("\n=== [PHYSICAL SILICON EXECUTION RECEIPT] ===\n", .{});
+    std.debug.print("Argmax Decoded Token ID : {d}\n", .{last_result.argmax_token});
+    std.debug.print("Maximum Vocab Logit     : {d:.6}\n", .{last_result.max_logit});
+    std.debug.print("Token 0 Logit           : {d:.6}\n", .{last_result.token0_logit});
+    std.debug.print("Final Hidden Vector Norm: {d:.6}\n", .{last_result.hidden_norm});
+    std.debug.print("Mean Latency            : {d:.2} ms ({d:.3} s)\n", .{ mean_ms, mean_ms / 1000.0 });
+    std.debug.print("Throughput              : {d:.2} tokens/sec\n", .{throughput});
+    std.debug.print("Numerical Soundness     : {s}\n", .{if (last_result.all_finite) "100% FINITE (Zero NaN / Zero Inf)" else "FAILED (NaN or Inf present)"});
+
+    // Write output logits binary if requested
+    if (out_logits_path) |olp| {
+        const fd_val = std.os.linux.open(olp, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+        if (std.os.linux.errno(fd_val) == .SUCCESS) {
+            const fd: std.posix.fd_t = @intCast(fd_val);
+            defer _ = std.os.linux.close(fd);
+            const raw_logits_bytes = std.mem.sliceAsBytes(engine.logits_buf);
+            _ = std.os.linux.write(fd, raw_logits_bytes.ptr, raw_logits_bytes.len);
+            std.debug.print("Exported Logits Binary  : {s} ({d} floats, {d} bytes)\n", .{ olp, engine.logits_buf.len, raw_logits_bytes.len });
+        }
+    }
+
+    // Emit spoke telemetry JSON
+    const spoke_outbox_path = "run/spoke_outbox/metal.chpe_fwd.result.json";
+    const out_fd_val = std.os.linux.open(spoke_outbox_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    if (std.os.linux.errno(out_fd_val) == .SUCCESS) {
+        const out_fd: std.posix.fd_t = @intCast(out_fd_val);
+        defer _ = std.os.linux.close(out_fd);
+        var json_buf: [1024]u8 = undefined;
+        const json_slice = std.fmt.bufPrint(&json_buf,
             \\{{
-            \\  "model": "Qwen2.5-3B-Instruct",
+            \\  "benchmark": "CHPE Forward Engine",
+            \\  "model": "{s}",
             \\  "archive": "{s}",
-            \\  "layers_executed": 36,
-            \\  "benchmark_runs": {},
-            \\  "min_ms": {d:.2},
-            \\  "mean_ms": {d:.2},
-            \\  "max_ms": {d:.2},
-            \\  "tokens_per_sec": {d:.3},
-            \\  "argmax_token": {},
+            \\  "tokens_evaluated": {d},
+            \\  "argmax_token": {d},
             \\  "max_logit": {d:.6},
             \\  "token0_logit": {d:.6},
             \\  "hidden_norm": {d:.6},
-            \\  "all_finite": {},
-            \\  "status": "{s}"
+            \\  "mean_latency_ms": {d:.2},
+            \\  "throughput_tok_s": {d:.2},
+            \\  "all_finite": {s}
             \\}}
             \\
         , .{
+            arch.name,
             archive_path,
-            bench_iters,
-            min_ms,
-            avg_ms,
-            max_ms,
-            tokens_per_sec,
-            last_res.argmax_token,
-            last_res.max_logit,
-            last_res.token0_logit,
-            last_res.hidden_norm,
-            last_res.all_finite,
-            if (last_res.all_finite) "PASS" else "FAIL",
-        });
-
-        _ = std.os.linux.write(fd, json_str.ptr, json_str.len);
-        std.debug.print("Telemetry written to {s}\n", .{out_path});
+            prompt_tokens.len,
+            last_result.argmax_token,
+            last_result.max_logit,
+            last_result.token0_logit,
+            last_result.hidden_norm,
+            mean_ms,
+            throughput,
+            if (last_result.all_finite) "true" else "false",
+        }) catch "";
+        _ = std.os.linux.write(out_fd, json_slice.ptr, json_slice.len);
+        std.debug.print("Recorded Spoke Telemetry: {s}\n", .{spoke_outbox_path});
     }
 }
